@@ -77,7 +77,7 @@ input_ids    = [a1 a2 a3 a4 a5 b1 b2 b3]   ← 一维，没有 pad
 cu_seqlens_q = [0, 5, 8]                    ← A 占 [0,5)，B 占 [5,8)
 ```
 
-`flash_attn_varlen_func` 根据 `cu_seqlens` 只在每条序列内部计算 attention（[model_runner.py `prepare_prefill`](../nanovllm/engine/model_runner.py#L129-L170)）。decode 时则用 `context_lens` 记录每条序列各自的上下文长度（[model_runner.py `prepare_decode`](../nanovllm/engine/model_runner.py#L172-L188)）。这样计算量只与真实 token 数成正比，跟谁长谁短无关。
+`flash_attn_varlen_func` 根据 `cu_seqlens` 只在每条序列内部计算 attention（[model_runner.py `prepare_prefill`](../../nanovllm/engine/model_runner.py#L129-L170)）。decode 时则用 `context_lens` 记录每条序列各自的上下文长度（[model_runner.py `prepare_decode`](../../nanovllm/engine/model_runner.py#L172-L188)）。这样计算量只与真实 token 数成正比，跟谁长谁短无关。
 
 ### 2. PagedAttention：解决"显存怎么分"
 
@@ -94,22 +94,22 @@ batch 开不大，continuous batching 的收益也就没有了。
 
 **解法**：借鉴操作系统的分页机制。
 
-- 把 KV cache 切成固定大小的 block（nano-vllm 中每块 256 个 token），见 [model_runner.py `allocate_kv_cache`](../nanovllm/engine/model_runner.py#L103-L121)。
+- 把 KV cache 切成固定大小的 block（nano-vllm 中每块 256 个 token），见 [model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)。
 - 每条序列维护一张 `block_table`（逻辑块号 → 物理块号），物理块**不需要连续**，任何空闲块都能用。
-- **按需分配**：prefill 时只分配 prompt 需要的块；decode 时只在序列写满当前块、跨入新块时才多分配一个（[block_manager.py `may_append`](../nanovllm/engine/block_manager.py#L106)）。
+- **按需分配**：prefill 时只分配 prompt 需要的块；decode 时只在序列写满当前块、跨入新块时才多分配一个（[block_manager.py `may_append`](../../nanovllm/engine/block_manager.py#L106)）。
 - **结束立即归还**：序列结束后 `deallocate`，空出的块下一个 step 就能给新序列用。
 
 同一个例子：每条序列最多浪费不到一个块，平均 600 个 token 只占 3 个块，25600 个 token 能放下**约 30 条**序列，并发数提升了好几倍。
 
-另一个好处是，attention kernel 通过 `block_table` 找到每条序列自己的 KV（[attention.py](../nanovllm/layers/attention.py#L72)），**KV 不再绑定"batch 里第几行"**。所以序列在 batch 里的位置每步都可以变，有序列退出也不需要搬动其他序列的数据。
+另一个好处是，attention kernel 通过 `block_table` 找到每条序列自己的 KV（[attention.py](../../nanovllm/layers/attention.py#L72)），**KV 不再绑定"batch 里第几行"**。所以序列在 batch 里的位置每步都可以变，有序列退出也不需要搬动其他序列的数据。
 
 ### 3. 抢占：解决"乐观接纳后显存可能不够"
 
-**问题**：这是第 2 点带来的副作用。看接纳新序列时的检查（[block_manager.py `can_allocate`](../nanovllm/engine/block_manager.py#L58-L73)），它只检查**当前 prompt**需要的块够不够，没有为将来要生成的 token 预留空间。这是一种**乐观接纳**（overcommit）：先让尽量多的序列跑起来，赌它们不会同时变得很长。
+**问题**：这是第 2 点带来的副作用。看接纳新序列时的检查（[block_manager.py `can_allocate`](../../nanovllm/engine/block_manager.py#L58-L73)），它只检查**当前 prompt**需要的块够不够，没有为将来要生成的 token 预留空间。这是一种**乐观接纳**（overcommit）：先让尽量多的序列跑起来，赌它们不会同时变得很长。
 
 但赌输的情况是会发生的。所有 running 序列每步都在变长，某个时刻某条序列需要新块，而空闲块已经用完。静态批处理按最大长度预留，永远不会遇到这种情况；乐观接纳则必须有兜底方案。
 
-**解法**：牺牲一部分序列，腾出空间。见 [scheduler.py](../nanovllm/engine/scheduler.py#L60-L65)：
+**解法**：牺牲一部分序列，腾出空间。见 [scheduler.py](../../nanovllm/engine/scheduler.py#L60-L65)：
 
 ```python
 while not self.block_manager.can_append(seq):   # 需要新块但没有空闲块
@@ -119,7 +119,7 @@ while not self.block_manager.can_append(seq):   # 需要新块但没有空闲块
         self.preempt(seq)                       # 只剩自己了，就抢占自己
 ```
 
-[`preempt()`](../nanovllm/engine/scheduler.py#L75) 的做法：释放被踢序列的所有块，把它放回 `waiting` **队头**，等有空间时**重新 prefill**（recompute）。重算会多花一点时间，但换来了平时高得多的并发。另外，如果它原来的块还没被覆盖，重新 prefill 时还能命中 prefix cache，少算一部分。
+[`preempt()`](../../nanovllm/engine/scheduler.py#L75) 的做法：释放被踢序列的所有块，把它放回 `waiting` **队头**，等有空间时**重新 prefill**（recompute）。重算会多花一点时间，但换来了平时高得多的并发。另外，如果它原来的块还没被覆盖，重新 prefill 时还能命中 prefix cache，少算一部分。
 
 ### 用操作系统来类比
 
@@ -148,7 +148,7 @@ LLMEngine.generate()  ──循环──►  step()
 
 ### 1. 以 step 为单位的主循环
 
-[llm_engine.py `step`](../nanovllm/engine/llm_engine.py#L49-L55)：
+[llm_engine.py `step`](../../nanovllm/engine/llm_engine.py#L49-L55)：
 
 ```python
 def step(self):
@@ -158,11 +158,11 @@ def step(self):
     outputs = [... for seq in seqs if seq.is_finished]  # 结束的立即返回
 ```
 
-`generate()` 中的 `while not self.is_finished()`（[llm_engine.py](../nanovllm/engine/llm_engine.py#L73)）不断调用 `step()`。**每次 step 都重新调度一次**，这就是 iteration-level scheduling。
+`generate()` 中的 `while not self.is_finished()`（[llm_engine.py](../../nanovllm/engine/llm_engine.py#L73)）不断调用 `step()`。**每次 step 都重新调度一次**，这就是 iteration-level scheduling。
 
 ### 2. 序列状态机：waiting / running 两个队列
 
-[sequence.py](../nanovllm/engine/sequence.py) 中每条请求是一个 `Sequence`，状态有 `WAITING → RUNNING → FINISHED` 三种。调度器（[scheduler.py](../nanovllm/engine/scheduler.py#L16-L17)）维护两个队列：
+[sequence.py](../../nanovllm/engine/sequence.py) 中每条请求是一个 `Sequence`，状态有 `WAITING → RUNNING → FINISHED` 三种。调度器（[scheduler.py](../../nanovllm/engine/scheduler.py#L16-L17)）维护两个队列：
 
 - `waiting`：还没完成 prefill 的序列（新请求、被抢占的请求）
 - `running`：已完成 prefill、正在 decode 的序列
@@ -171,24 +171,24 @@ def step(self):
 
 ### 3. 调度策略 `schedule()`
 
-[scheduler.py `schedule`](../nanovllm/engine/scheduler.py#L25-L73) 采用 **prefill 优先**的策略，**同一个 step 里不混合 prefill 和 decode**。
+[scheduler.py `schedule`](../../nanovllm/engine/scheduler.py#L25-L73) 采用 **prefill 优先**的策略，**同一个 step 里不混合 prefill 和 decode**。
 
-**(a) Prefill 阶段**（[第 29-55 行](../nanovllm/engine/scheduler.py#L29-L55)）
+**(a) Prefill 阶段**（[第 29-55 行](../../nanovllm/engine/scheduler.py#L29-L55)）
 
 - 从 `waiting` 队头依次取序列，受两个预算约束：`max_num_seqs`（默认 512）和 `max_num_batched_tokens`（默认 16384）。
 - `block_manager.can_allocate()` 检查 KV block 是否足够（同时计算 prefix cache 命中了多少 block）。不够就停止接纳新序列。
-- **Chunked prefill**（[第 42 行](../nanovllm/engine/scheduler.py#L42)）：token 预算不够时，**只有 batch 里的第一条序列**可以只算一部分（`min(num_tokens, remaining)`）。剩余部分留在 `waiting` 队头，下个 step 接着算。这样超长 prompt 不会卡住调度。
+- **Chunked prefill**（[第 42 行](../../nanovllm/engine/scheduler.py#L42)）：token 预算不够时，**只有 batch 里的第一条序列**可以只算一部分（`min(num_tokens, remaining)`）。剩余部分留在 `waiting` 队头，下个 step 接着算。这样超长 prompt 不会卡住调度。
 - prompt 全部算完的序列转入 `running`。
 - 只要本轮调度到了任何 prefill，就直接返回 `is_prefill=True`。
 
-**(b) Decode 阶段**（[第 57-73 行](../nanovllm/engine/scheduler.py#L57-L73)）
+**(b) Decode 阶段**（[第 57-73 行](../../nanovllm/engine/scheduler.py#L57-L73)）
 
 - 没有待 prefill 的序列时，从 `running` 中取序列，每条本步只算 1 个 token。
 - `can_append()` 检查这条序列跨入新 block 时是否还有空闲 block，不够就触发上文所述的抢占。
 
 ### 4. 结束即回收：`postprocess()`
 
-[scheduler.py `postprocess`](../nanovllm/engine/scheduler.py#L81-L92)：
+[scheduler.py `postprocess`](../../nanovllm/engine/scheduler.py#L81-L92)：
 
 - 更新 `num_cached_tokens`。chunked prefill 还没算完的序列直接 `continue`，不追加 token。
 - 追加采样到的 token；遇到 EOS 或达到 `max_tokens` 时，序列标记为 `FINISHED`，**立即 `deallocate` 释放 KV block**，并从 `running` 移除。
@@ -196,15 +196,15 @@ def step(self):
 
 ### 5. 扁平化 batch 与 Context 传递
 
-`ModelRunner` 把调度结果整理成一维的 `input_ids` / `positions`，以及 `cu_seqlens`、`slot_mapping`、`context_lens`、`block_tables` 等元数据。元数据通过全局 [Context](../nanovllm/utils/context.py) 传进每一层的 `Attention`，模型代码本身不需要知道 batch 的结构。`slot_mapping` 告诉 [store_kvcache](../nanovllm/layers/attention.py#L33) 这个 Triton kernel，每个新 token 的 K/V 写到物理 cache 的哪个位置。
+`ModelRunner` 把调度结果整理成一维的 `input_ids` / `positions`，以及 `cu_seqlens`、`slot_mapping`、`context_lens`、`block_tables` 等元数据。元数据通过全局 [Context](../../nanovllm/utils/context.py) 传进每一层的 `Attention`，模型代码本身不需要知道 batch 的结构。`slot_mapping` 告诉 [store_kvcache](../../nanovllm/layers/attention.py#L33) 这个 Triton kernel，每个新 token 的 K/V 写到物理 cache 的哪个位置。
 
 ### 6. Prefix caching
 
-[block_manager.py](../nanovllm/engine/block_manager.py) 按 block 做链式 hash（`hash_blocks` / `can_allocate`），相同前缀的 block 通过 `ref_count` 在序列间共享，减少重复 prefill。被抢占的序列重新 prefill 时也能从中受益。
+[block_manager.py](../../nanovllm/engine/block_manager.py) 按 block 做链式 hash（`hash_blocks` / `can_allocate`），相同前缀的 block 通过 `ref_count` 在序列间共享，减少重复 prefill。被抢占的序列重新 prefill 时也能从中受益。
 
 ### 7. 适配不断变化的 batch size：CUDA Graph 分桶
 
-decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形状固定。`capture_cudagraph`（[model_runner.py](../nanovllm/engine/model_runner.py#L234)）预先为 `bs = 1, 2, 4, 8, 16, 32, …, 512` 各录制一张图。运行时（[`run_model`](../nanovllm/engine/model_runner.py#L197-L212)）选**不小于当前 bs 的最小一档**，多出的位置用 `slot_mapping = -1` 填充，kernel 遇到 -1 会直接跳过写入。prefill 每步长度变化太大，所以走 eager 模式。
+decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形状固定。`capture_cudagraph`（[model_runner.py](../../nanovllm/engine/model_runner.py#L234)）预先为 `bs = 1, 2, 4, 8, 16, 32, …, 512` 各录制一张图。运行时（[`run_model`](../../nanovllm/engine/model_runner.py#L197-L212)）选**不小于当前 bs 的最小一档**，多出的位置用 `slot_mapping = -1` 填充，kernel 遇到 -1 会直接跳过写入。prefill 每步长度变化太大，所以走 eager 模式。
 
 ---
 

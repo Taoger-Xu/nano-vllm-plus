@@ -89,7 +89,7 @@ vLLM 论文统计，当时的系统里 KV cache 只有 **20%–38%** 真正存�
 
 ## 三、物理层：一块大张量
 
-[model_runner.py `allocate_kv_cache`](../nanovllm/engine/model_runner.py#L103-L121)：
+[model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)：
 
 ```python
 self.kv_cache = torch.empty(2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)
@@ -102,13 +102,13 @@ module.v_cache = self.kv_cache[1, i]
 - **同一个 block id 在所有层通用**：物理块 7 指的是每一层 `k_cache[7]` 和 `v_cache[7]` 这一组位置。所以逻辑层只需要管理一套 block id，不用每层各管一套。
 - 块的数量由显存测量结果决定，见 [ModelRunner.md](ModelRunner.md#-kv-cache-容量规划)。
 
-**块大小为什么是 256**：[config.py](../nanovllm/config.py#L22) 中有 `assert kvcache_block_size % 256 == 0`。这是 FlashAttention 分页 KV 接口的要求：使用 `block_table` 时，page block size 必须是 256 的倍数。
+**块大小为什么是 256**：[config.py](../../nanovllm/config.py#L22) 中有 `assert kvcache_block_size % 256 == 0`。这是 FlashAttention 分页 KV 接口的要求：使用 `block_table` 时，page block size 必须是 256 的倍数。
 
 ---
 
 ## 四、逻辑层：Block 与 BlockManager
 
-代码在 [block_manager.py](../nanovllm/engine/block_manager.py)，共 120 行。下面先看数据结构和不变式，再看块的状态机，最后逐个方法分析。
+代码在 [block_manager.py](../../nanovllm/engine/block_manager.py)，共 120 行。下面先看数据结构和不变式，再看块的状态机，最后逐个方法分析。
 
 ### 1. 数据结构
 
@@ -126,7 +126,7 @@ class BlockManager:
     hash_to_block_id: dict[int,int] # 前缀 hash → 物理块号（prefix cache 的索引）
 ```
 
-还有 `Sequence` 中与之相关的字段（[sequence.py](../nanovllm/engine/sequence.py)）：
+还有 `Sequence` 中与之相关的字段（[sequence.py](../../nanovllm/engine/sequence.py)）：
 
 | 字段 | 含义 |
 |---|---|
@@ -182,7 +182,7 @@ BlockManager 的所有方法都在维护下面几条性质。理解了它们，�
 
 ### 4. 链式 hash：`compute_hash`
 
-[block_manager.py:35-41](../nanovllm/engine/block_manager.py#L35-L41)：
+[block_manager.py:35-41](../../nanovllm/engine/block_manager.py#L35-L41)：
 
 ```python
 def compute_hash(cls, token_ids, prefix=-1):
@@ -205,7 +205,7 @@ hash 是 64 位的。`can_allocate` 命中时还会比较本块的 `token_ids` �
 
 ### 5. 两个底层操作：`_allocate_block` / `_deallocate_block`
 
-[block_manager.py:43-56](../nanovllm/engine/block_manager.py#L43-L56)：
+[block_manager.py:43-56](../../nanovllm/engine/block_manager.py#L43-L56)：
 
 ```python
 def _allocate_block(self) -> int:
@@ -231,11 +231,11 @@ def _deallocate_block(self, block_id: int):
 
 ### 6. Prefill 分配：`can_allocate` + `allocate`
 
-调用位置在 [scheduler.py:35-45](../nanovllm/engine/scheduler.py#L35-L45)：只有当 `seq.block_table` 为空时才调用。这有两种情况：序列第一次被调度，或者被抢占后重新调度。chunked prefill 的后续块不会再调用，因为第一次就已经分配好了。
+调用位置在 [scheduler.py:35-45](../../nanovllm/engine/scheduler.py#L35-L45)：只有当 `seq.block_table` 为空时才调用。这有两种情况：序列第一次被调度，或者被抢占后重新调度。chunked prefill 的后续块不会再调用，因为第一次就已经分配好了。
 
 #### `can_allocate`：查命中，算需要几个新块
 
-[block_manager.py:58-73](../nanovllm/engine/block_manager.py#L58-L73)：
+[block_manager.py:58-73](../../nanovllm/engine/block_manager.py#L58-L73)：
 
 ```python
 def can_allocate(self, seq) -> int:
@@ -261,11 +261,11 @@ def can_allocate(self, seq) -> int:
 - **③ 命中块对空闲块数量的影响**：
   - 命中的块是 **USED_HASHED**（正在被别人用）：直接共享，不占用空闲块，`num_new_blocks -= 1`；
   - 命中的块是 **FREE_CACHED**（在空闲队列里）：要把它从空闲队列中取出来，**仍然消耗一个空闲名额**，所以不减。
-- 返回值约定：`-1` 表示放不下，`≥0` 表示命中的块数。调度器用 `== -1` 判断（[scheduler.py:37](../nanovllm/engine/scheduler.py#L37)）。
+- 返回值约定：`-1` 表示放不下，`≥0` 表示命中的块数。调度器用 `== -1` 判断（[scheduler.py:37](../../nanovllm/engine/scheduler.py#L37)）。
 
 #### `allocate`：真正建立 block_table
 
-[block_manager.py:75-92](../nanovllm/engine/block_manager.py#L75-L92)：
+[block_manager.py:75-92](../../nanovllm/engine/block_manager.py#L75-L92)：
 
 ```python
 def allocate(self, seq, num_cached_blocks):
@@ -296,7 +296,7 @@ def allocate(self, seq, num_cached_blocks):
 
 ### 7. Decode 追加：`can_append` + `may_append`
 
-[block_manager.py:103-108](../nanovllm/engine/block_manager.py#L103-L108)，调用位置在 [scheduler.py:60-69](../nanovllm/engine/scheduler.py#L60-L69)：
+[block_manager.py:103-108](../../nanovllm/engine/block_manager.py#L103-L108)，调用位置在 [scheduler.py:60-69](../../nanovllm/engine/scheduler.py#L60-L69)：
 
 ```python
 def can_append(self, seq) -> bool:
@@ -322,7 +322,7 @@ step k+1 的 schedule  ：本步要把这个新 token（下标 n-1）的 K/V 写
 
 ### 8. 登记 hash：`hash_blocks`
 
-[block_manager.py:110-120](../nanovllm/engine/block_manager.py#L110-L120)，在 [scheduler.py:83](../nanovllm/engine/scheduler.py#L83) 被调用。注意它在 `num_cached_tokens` 更新**之前**调用：
+[block_manager.py:110-120](../../nanovllm/engine/block_manager.py#L110-L120)，在 [scheduler.py:83](../../nanovllm/engine/scheduler.py#L83) 被调用。注意它在 `num_cached_tokens` 更新**之前**调用：
 
 ```python
 def hash_blocks(self, seq):
@@ -347,7 +347,7 @@ def hash_blocks(self, seq):
 
 ### 9. 释放：`deallocate`
 
-[block_manager.py:94-101](../nanovllm/engine/block_manager.py#L94-L101)，在序列结束（[scheduler.py:91](../nanovllm/engine/scheduler.py#L91)）和被抢占（[scheduler.py:78](../nanovllm/engine/scheduler.py#L78)）时调用：
+[block_manager.py:94-101](../../nanovllm/engine/block_manager.py#L94-L101)，在序列结束（[scheduler.py:91](../../nanovllm/engine/scheduler.py#L91)）和被抢占（[scheduler.py:78](../../nanovllm/engine/scheduler.py#L78)）时调用：
 
 ```python
 def deallocate(self, seq):
@@ -496,12 +496,12 @@ slot = block_table[pos // block_size] * block_size + pos % block_size
 
 把物理 cache 看成一个长度为 `num_blocks × block_size` 的一维数组，slot 就是这个一维数组里的下标。
 
-- Prefill：[model_runner.py](../nanovllm/engine/model_runner.py#L152-L162) 按块计算区间 `[num_cached_tokens, num_cached_tokens + num_scheduled_tokens)` 内每个 token 的槽位；
-- Decode：[model_runner.py](../nanovllm/engine/model_runner.py#L181) 计算 `block_table[-1] * block_size + last_block_num_tokens - 1`。
+- Prefill：[model_runner.py](../../nanovllm/engine/model_runner.py#L152-L162) 按块计算区间 `[num_cached_tokens, num_cached_tokens + num_scheduled_tokens)` 内每个 token 的槽位；
+- Decode：[model_runner.py](../../nanovllm/engine/model_runner.py#L181) 计算 `block_table[-1] * block_size + last_block_num_tokens - 1`。
 
 **读：`block_tables`，每条序列一行**
 
-[`prepare_block_tables`](../nanovllm/engine/model_runner.py#L123-L127) 把各序列的 block_table 用 -1 补齐成 `[num_seqs, max_blocks]` 的矩形张量，交给 attention kernel。
+[`prepare_block_tables`](../../nanovllm/engine/model_runner.py#L123-L127) 把各序列的 block_table 用 -1 补齐成 `[num_seqs, max_blocks]` 的矩形张量，交给 attention kernel。
 
 ---
 
@@ -509,7 +509,7 @@ slot = block_table[pos // block_size] * block_size + pos % block_size
 
 ### 1. 写入：Triton kernel `store_kvcache`
 
-[attention.py](../nanovllm/layers/attention.py#L10-L40)：
+[attention.py](../../nanovllm/layers/attention.py#L10-L40)：
 
 ```python
 @triton.jit
@@ -527,7 +527,7 @@ def store_kvcache_kernel(...):
 
 ### 2. 读取：FlashAttention 的 `block_table` 参数
 
-[attention.py](../nanovllm/layers/attention.py#L64-L75)：
+[attention.py](../../nanovllm/layers/attention.py#L64-L75)：
 
 ```python
 if context.is_prefill:

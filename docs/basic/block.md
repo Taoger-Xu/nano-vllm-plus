@@ -1,6 +1,6 @@
 # Block 与 BlockManager：使用场景、Chunked Prefill 与显存安全
 
-本文从**使用场景**的角度梳理 [block_manager.py](../nanovllm/engine/block_manager.py)：每个函数在什么时候被调用、为什么被调用。然后介绍与块分配密切相关的 chunked prefill，并回答"分块计算会不会让显存溢出"这个问题。
+本文从**使用场景**的角度梳理 [block_manager.py](../../nanovllm/engine/block_manager.py)：每个函数在什么时候被调用、为什么被调用。然后介绍与块分配密切相关的 chunked prefill，并回答"分块计算会不会让显存溢出"这个问题。
 
 每个函数内部的逐行分析、块的状态机和完整状态追踪，见 [PagedAttention.md](PagedAttention.md)。本文不重复那些内容。
 
@@ -23,7 +23,7 @@ Block
 └─ reset    ← 只被 _allocate_block 调用（块被重新分配）
 ```
 
-**BlockManager 只有 Scheduler 一个调用方**（[scheduler.py](../nanovllm/engine/scheduler.py)）。ModelRunner 不会调用它，只读取 `seq.block_table` 和 `num_cached_tokens` 这两个结果。
+**BlockManager 只有 Scheduler 一个调用方**（[scheduler.py](../../nanovllm/engine/scheduler.py)）。ModelRunner 不会调用它，只读取 `seq.block_table` 和 `num_cached_tokens` 这两个结果。
 
 ---
 
@@ -31,16 +31,16 @@ Block
 
 | # | 场景 | 触发的函数 | 调用位置 |
 |---|---|---|---|
-| 0 | 系统启动 | `BlockManager.__init__` | [scheduler.py:15](../nanovllm/engine/scheduler.py#L15) |
-| 1 | 新请求第一次 prefill | `can_allocate` → `allocate` → `_allocate_block` × n | [scheduler.py:36](../nanovllm/engine/scheduler.py#L36)、[:45](../nanovllm/engine/scheduler.py#L45) |
+| 0 | 系统启动 | `BlockManager.__init__` | [scheduler.py:15](../../nanovllm/engine/scheduler.py#L15) |
+| 1 | 新请求第一次 prefill | `can_allocate` → `allocate` → `_allocate_block` × n | [scheduler.py:36](../../nanovllm/engine/scheduler.py#L36)、[:45](../../nanovllm/engine/scheduler.py#L45) |
 | 2 | 新请求命中前缀 | 同上，部分块改为共享或从空闲队列中捞回 | 同上 |
-| 3 | 空闲块不够，接纳不了 | `can_allocate` 返回 -1 | [scheduler.py:37-38](../nanovllm/engine/scheduler.py#L37-L38) |
-| 4 | chunked prefill 的后续块 | 不分配块，只调用 `hash_blocks` | [scheduler.py:41](../nanovllm/engine/scheduler.py#L41)、[:83](../nanovllm/engine/scheduler.py#L83) |
-| 5 | 每一步结束 | `hash_blocks` → `Block.update` | [scheduler.py:83](../nanovllm/engine/scheduler.py#L83) |
-| 6 | decode，没跨入新块 | `can_append`（直接通过）→ `may_append`（什么都不做） | [scheduler.py:60](../nanovllm/engine/scheduler.py#L60)、[:69](../nanovllm/engine/scheduler.py#L69) |
+| 3 | 空闲块不够，接纳不了 | `can_allocate` 返回 -1 | [scheduler.py:37-38](../../nanovllm/engine/scheduler.py#L37-L38) |
+| 4 | chunked prefill 的后续块 | 不分配块，只调用 `hash_blocks` | [scheduler.py:41](../../nanovllm/engine/scheduler.py#L41)、[:83](../../nanovllm/engine/scheduler.py#L83) |
+| 5 | 每一步结束 | `hash_blocks` → `Block.update` | [scheduler.py:83](../../nanovllm/engine/scheduler.py#L83) |
+| 6 | decode，没跨入新块 | `can_append`（直接通过）→ `may_append`（什么都不做） | [scheduler.py:60](../../nanovllm/engine/scheduler.py#L60)、[:69](../../nanovllm/engine/scheduler.py#L69) |
 | 7 | decode，跨入新块 | `can_append` → `may_append` → `_allocate_block` | 同上 |
-| 8 | decode 时空闲块不够 | `can_append` 失败 → 抢占：`deallocate(被抢占者)` → 再次 `can_append` | [scheduler.py:60-65](../nanovllm/engine/scheduler.py#L60-L65)、[:78](../nanovllm/engine/scheduler.py#L78) |
-| 9 | 序列正常结束 | `deallocate` → `_deallocate_block` | [scheduler.py:91](../nanovllm/engine/scheduler.py#L91) |
+| 8 | decode 时空闲块不够 | `can_append` 失败 → 抢占：`deallocate(被抢占者)` → 再次 `can_append` | [scheduler.py:60-65](../../nanovllm/engine/scheduler.py#L60-L65)、[:78](../../nanovllm/engine/scheduler.py#L78) |
+| 9 | 序列正常结束 | `deallocate` → `_deallocate_block` | [scheduler.py:91](../../nanovllm/engine/scheduler.py#L91) |
 | 10 | 被抢占的序列重新调度 | 回到场景 1 或 2 | 同场景 1 |
 | 11 | 旧缓存被覆盖 | `_allocate_block` 中清除旧 hash（被动发生） | 场景 1、7 内部 |
 
@@ -233,9 +233,9 @@ step 4 起：进入 decode
 
 ### 2. 为什么需要
 
-**根本原因：每步的 token 数有上限。** 调度器每一步最多处理 `max_num_batched_tokens` 个 token（默认 16384，见 [config.py](../nanovllm/config.py)）。这个上限和显存规划直接相关：
+**根本原因：每步的 token 数有上限。** 调度器每一步最多处理 `max_num_batched_tokens` 个 token（默认 16384，见 [config.py](../../nanovllm/config.py)）。这个上限和显存规划直接相关：
 
-- 启动时，[warmup_model](../nanovllm/engine/model_runner.py#L91-L101) 正是用 `max_num_batched_tokens` 个 token 跑一次 prefill，测出**激活值的峰值显存**；
+- 启动时，[warmup_model](../../nanovllm/engine/model_runner.py#L91-L101) 正是用 `max_num_batched_tokens` 个 token 跑一次 prefill，测出**激活值的峰值显存**；
 - 然后从剩余显存中扣掉这个峰值，剩下的才分给 KV cache。
 
 也就是说，系统只为"每步最多 `max_num_batched_tokens` 个 token"预留了激活值显存。如果一个 prompt 比这个上限还长：
@@ -253,7 +253,7 @@ nano-vllm **不把 prefill 和 decode 混在一起**，而且 prefill 优先。�
 
 #### (1) 调度：决定这一步算多少
 
-[scheduler.py:30-53](../nanovllm/engine/scheduler.py#L30-L53) 的关键几行：
+[scheduler.py:30-53](../../nanovllm/engine/scheduler.py#L30-L53) 的关键几行：
 
 ```python
 remaining = self.max_num_batched_tokens - num_batched_tokens        # 本步还剩多少预算
@@ -277,7 +277,7 @@ scheduled_seqs.append(seq)
 
 #### (2) 执行：Q 只包含本段，K/V 包含整个前缀
 
-[prepare_prefill](../nanovllm/engine/model_runner.py#L129-L170)：
+[prepare_prefill](../../nanovllm/engine/model_runner.py#L129-L170)：
 
 ```python
 start = seq.num_cached_tokens                 # 本段起点
@@ -287,7 +287,7 @@ seqlen_q  = end - start
 seqlen_k  = end                               # K：从 0 到 end，包含之前所有 chunk
 ```
 
-从第二个 chunk 开始，`seqlen_k > seqlen_q`，于是会构造 `block_tables`。`Attention` 看到 `block_tables` 不为空，就改为从 `k_cache / v_cache` 中按块读取 K/V（[attention.py:65-66](../nanovllm/layers/attention.py#L65-L66)）。之前 chunk 的 K/V 已经在 cache 里，本段的 K/V 也在 attention 之前刚刚写进去，所以能读到完整的前缀。
+从第二个 chunk 开始，`seqlen_k > seqlen_q`，于是会构造 `block_tables`。`Attention` 看到 `block_tables` 不为空，就改为从 `k_cache / v_cache` 中按块读取 K/V（[attention.py:65-66](../../nanovllm/layers/attention.py#L65-L66)）。之前 chunk 的 K/V 已经在 cache 里，本段的 K/V 也在 attention 之前刚刚写进去，所以能读到完整的前缀。
 
 以 step 2 为例：
 
@@ -303,7 +303,7 @@ FlashAttention 在 `seqlen_q < seqlen_k` 时，causal mask 按**右下角对齐*
 
 #### (3) 后处理：中间的 chunk 不产出 token
 
-每个 chunk 的前向都会照常计算 logits、采样出一个 token。但对于中间的 chunk，这个 token 是没有意义的，因为 prompt 还没读完。[postprocess](../nanovllm/engine/scheduler.py#L81-L92) 会把它丢掉：
+每个 chunk 的前向都会照常计算 logits、采样出一个 token。但对于中间的 chunk，这个 token 是没有意义的，因为 prompt 还没读完。[postprocess](../../nanovllm/engine/scheduler.py#L81-L92) 会把它丢掉：
 
 ```python
 self.block_manager.hash_blocks(seq)                       # 登记本段写满的块
@@ -343,7 +343,7 @@ seq.append_token(token_id)
 | 大小取决于 | **本步处理的 token 数** | **序列的总长度** |
 | 由谁控制 | 每步 token 预算 `max_num_batched_tokens` + chunked prefill | 预分配的 KV 池 + BlockManager 的准入检查 |
 
-启动时，显存就按这个思路分好了（[allocate_kv_cache](../nanovllm/engine/model_runner.py#L103-L121)）：
+启动时，显存就按这个思路分好了（[allocate_kv_cache](../../nanovllm/engine/model_runner.py#L103-L121)）：
 
 ```
 GPU 显存 × gpu_memory_utilization
@@ -359,8 +359,8 @@ GPU 显存 × gpu_memory_utilization
 后面的 chunk 要 attend 到很长的前缀，K 变长了，显存会不会跟着变大？不会，原因有三个：
 
 1. **FlashAttention 不会生成 Q×K 的注意力矩阵**。普通 attention 要显式算出 `[len_q, len_k]` 的 scores 矩阵，K 越长，矩阵越大。FlashAttention 采用分块计算加在线 softmax，额外显存只和 Q 的长度有关，和 K 的长度无关。
-2. **前缀的 K/V 直接从 cache 中原地读取**。传给 kernel 的是 `k_cache` 和 `block_table`（[attention.py:65-66](../nanovllm/layers/attention.py#L65-L66)），不会把前缀的 K/V 拷贝出一份连续的副本。
-3. **LMHead 只算每条序列最后一个位置的 logits**（[embed_head.py](../nanovllm/layers/embed_head.py)）。输出是 `[序列数, vocab]`，而不是 `[token 数, vocab]`。
+2. **前缀的 K/V 直接从 cache 中原地读取**。传给 kernel 的是 `k_cache` 和 `block_table`（[attention.py:65-66](../../nanovllm/layers/attention.py#L65-L66)），不会把前缀的 K/V 拷贝出一份连续的副本。
+3. **LMHead 只算每条序列最后一个位置的 logits**（[embed_head.py](../../nanovllm/layers/embed_head.py)）。输出是 `[序列数, vocab]`，而不是 `[token 数, vocab]`。
 
 所以，一个 chunk 产生的激活值只和 **chunk 本身的长度**有关，和前缀有多长无关。
 
@@ -385,8 +385,8 @@ KV cache 确实会随着 chunk 一段段增长，但它**不会去申请新的�
 
 | 情况 | 结果 |
 |---|---|
-| **单个 prompt 需要的块数超过整个 KV 池** | `can_allocate` 永远返回 -1，序列一直卡在 `waiting` 队头。等 `running` 中的序列都跑完，`schedule()` 什么都调度不到，[scheduler.py:71](../nanovllm/engine/scheduler.py#L71) 的 `assert scheduled_seqs` 报错 |
-| **prompt 长度加上生成长度超过 `max_model_len`** | 代码不检查这一点。decode 走 CUDA Graph 时，`graph_vars["block_tables"]` 只有 `max_model_len / block_size` 列，序列的块数超过这个值，拷贝时会形状不匹配并报错（[model_runner.py:210](../nanovllm/engine/model_runner.py#L210)） |
+| **单个 prompt 需要的块数超过整个 KV 池** | `can_allocate` 永远返回 -1，序列一直卡在 `waiting` 队头。等 `running` 中的序列都跑完，`schedule()` 什么都调度不到，[scheduler.py:71](../../nanovllm/engine/scheduler.py#L71) 的 `assert scheduled_seqs` 报错 |
+| **prompt 长度加上生成长度超过 `max_model_len`** | 代码不检查这一点。decode 走 CUDA Graph 时，`graph_vars["block_tables"]` 只有 `max_model_len / block_size` 列，序列的块数超过这个值，拷贝时会形状不匹配并报错（[model_runner.py:210](../../nanovllm/engine/model_runner.py#L210)） |
 | **warmup 之后显存环境发生变化** | 比如同一张卡上又启动了别的进程，或者显存碎片导致实际可用显存比测量时少。这种情况下仍可能 OOM，`gpu_memory_utilization` 默认设为 0.9 就是为了留出余量 |
 
 vLLM 会在 `add_request` 时就拒绝超过 `max_model_len` 的请求，nano-vllm 省略了这一步。
@@ -432,7 +432,7 @@ prefill 要写入 6 个 token 的 KV，每个 token 对应的格子是：
 | t4 | 4 | 1 | 7 | 0 | 7×4+0 = **28** |
 | t5 | 5 | 1 | 7 | 1 | **29** |
 
-所以 `slot_mapping = [12, 13, 14, 15, 28, 29]`。每一层的 Attention 都按这个列表，把 6 个 token 的 K/V 写到对应的格子里（[store_kvcache](../nanovllm/layers/attention.py#L33)）。块 7 的格子 30、31 暂时空着，留给之后生成的 token。
+所以 `slot_mapping = [12, 13, 14, 15, 28, 29]`。每一层的 Attention 都按这个列表，把 6 个 token 的 K/V 写到对应的格子里（[store_kvcache](../../nanovllm/layers/attention.py#L33)）。块 7 的格子 30、31 暂时空着，留给之后生成的 token。
 
 ### 2. hash_blocks：把写满的块登记下来，供以后复用
 

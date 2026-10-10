@@ -40,18 +40,18 @@ Attention 里，历史 token 的 K、V 不会随着新 token 的到来而改变�
 
 **引擎要考虑的问题**：KV cache 放在哪里、占多少显存、怎么组织布局。
 
-**nano-vllm 的做法**：启动时预分配一整块 KV cache 张量（[model_runner.py `allocate_kv_cache`](../nanovllm/engine/model_runner.py#L103-L121)）。每层 `Attention` 在前向时先把新的 K/V 写进 cache（Triton kernel `store_kvcache`），再进行 attention 计算（[attention.py](../nanovllm/layers/attention.py#L59-L75)）。
+**nano-vllm 的做法**：启动时预分配一整块 KV cache 张量（[model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)）。每层 `Attention` 在前向时先把新的 K/V 写进 cache（Triton kernel `store_kvcache`），再进行 attention 计算（[attention.py](../../nanovllm/layers/attention.py#L59-L75)）。
 
 ### 2.2 只算需要的 logits
 
 Prefill 阶段只需要最后一个位置的 logits 来采样下一个 token。对全部 N 个位置都做 `hidden → vocab` 的投影，是很大的浪费（词表通常有 15 万左右）。
 
-**nano-vllm 的做法**：prefill 时，`ParallelLMHead` 根据 `cu_seqlens_q` 只取每条序列最后一个 token 的 hidden state 来计算 logits（[embed_head.py](../nanovllm/layers/embed_head.py#L57-L66)）。
+**nano-vllm 的做法**：prefill 时，`ParallelLMHead` 根据 `cu_seqlens_q` 只取每条序列最后一个 token 的 hidden state 来计算 logits（[embed_head.py](../../nanovllm/layers/embed_head.py#L57-L66)）。
 
 ### 2.3 采样与停止条件
 
-- **采样**：nano-vllm 只支持 temperature 采样，不支持 greedy（`temperature` 必须大于 0，见 [sampling_params.py](../nanovllm/sampling_params.py)）。[Sampler](../nanovllm/layers/sampler.py) 采用指数分布技巧（Gumbel-max 的等价形式）：`argmax(p_i / E_i)`，其中 `E_i ~ Exp(1)`。它与按 `p` 采样在数学上等价，但避免了 `torch.multinomial`，整个函数可以被 `torch.compile` 编译。
-- **停止**：遇到 EOS（除非设置了 `ignore_eos`），或生成长度达到 `max_tokens`（[scheduler.py `postprocess`](../nanovllm/engine/scheduler.py#L81-L92)）。
+- **采样**：nano-vllm 只支持 temperature 采样，不支持 greedy（`temperature` 必须大于 0，见 [sampling_params.py](../../nanovllm/sampling_params.py)）。[Sampler](../../nanovllm/layers/sampler.py) 采用指数分布技巧（Gumbel-max 的等价形式）：`argmax(p_i / E_i)`，其中 `E_i ~ Exp(1)`。它与按 `p` 采样在数学上等价，但避免了 `torch.multinomial`，整个函数可以被 `torch.compile` 编译。
+- **停止**：遇到 EOS（除非设置了 `ignore_eos`），或生成长度达到 `max_tokens`（[scheduler.py `postprocess`](../../nanovllm/engine/scheduler.py#L81-L92)）。
 
 ### 2.4 Decode 阶段的性能问题
 
@@ -59,10 +59,10 @@ Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小�
 
 | 问题 | 手段 | nano-vllm 中的位置 |
 |---|---|---|
-| 一次前向要发射几百个 kernel，CPU 开销大 | **CUDA Graph**：预先录制整次前向，运行时一次性 replay | [model_runner.py `capture_cudagraph`](../nanovllm/engine/model_runner.py#L223) |
-| 小算子很多，访存次数多 | **算子融合**：用 `torch.compile` 融合 RMSNorm（含残差相加）、SiLU×Mul、RoPE、Sampler | [layernorm.py](../nanovllm/layers/layernorm.py)、[activation.py](../nanovllm/layers/activation.py)、[rotary_embedding.py](../nanovllm/layers/rotary_embedding.py) |
-| 多个小 GEMM | **权重合并**：Q/K/V 合并成一个 `qkv_proj`，gate/up 合并成一个 `gate_up_proj` | [linear.py](../nanovllm/layers/linear.py)，[qwen3.py `packed_modules_mapping`](../nanovllm/models/qwen3.py) |
-| Attention 计算本身的效率 | **FlashAttention** | [attention.py](../nanovllm/layers/attention.py) |
+| 一次前向要发射几百个 kernel，CPU 开销大 | **CUDA Graph**：预先录制整次前向，运行时一次性 replay | [model_runner.py `capture_cudagraph`](../../nanovllm/engine/model_runner.py#L223) |
+| 小算子很多，访存次数多 | **算子融合**：用 `torch.compile` 融合 RMSNorm（含残差相加）、SiLU×Mul、RoPE、Sampler | [layernorm.py](../../nanovllm/layers/layernorm.py)、[activation.py](../../nanovllm/layers/activation.py)、[rotary_embedding.py](../../nanovllm/layers/rotary_embedding.py) |
+| 多个小 GEMM | **权重合并**：Q/K/V 合并成一个 `qkv_proj`，gate/up 合并成一个 `gate_up_proj` | [linear.py](../../nanovllm/layers/linear.py)，[qwen3.py `packed_modules_mapping`](../../nanovllm/models/qwen3.py) |
+| Attention 计算本身的效率 | **FlashAttention** | [attention.py](../../nanovllm/layers/attention.py) |
 
 ### 2.5 模型太大，一张卡放不下或算得太慢：张量并行
 
@@ -99,16 +99,16 @@ Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小�
 
 | 问题 | 方案 | 代码位置 |
 |---|---|---|
-| 组 batch 的粒度 | 每个 step 调度一次（iteration-level） | [llm_engine.py `step`](../nanovllm/engine/llm_engine.py#L49-L55) |
-| 序列长度不一 | 拼成一维 batch，配合 `cu_seqlens`；prefill 用 `flash_attn_varlen_func` | [model_runner.py `prepare_prefill`](../nanovllm/engine/model_runner.py#L129-L170) |
-| decode 时各序列上下文长度不同 | `context_lens` + `block_tables`，调用 `flash_attn_with_kvcache` | [model_runner.py `prepare_decode`](../nanovllm/engine/model_runner.py#L172-L188) |
-| KV 显存管理 | 每个 block 256 个 token，用 block table 做逻辑块到物理块的映射 | [block_manager.py](../nanovllm/engine/block_manager.py) |
-| 显存耗尽 | 踢掉最晚加入的序列，释放它的 block，之后重新 prefill | [scheduler.py `preempt`](../nanovllm/engine/scheduler.py#L75) |
-| 调度策略 | prefill 优先，不混批；受 `max_num_seqs` 和 `max_num_batched_tokens` 两个预算约束 | [scheduler.py `schedule`](../nanovllm/engine/scheduler.py#L25-L73) |
-| 超长 prompt | chunked prefill（只允许 batch 中第一条序列被切块） | [scheduler.py](../nanovllm/engine/scheduler.py#L42) |
-| batch size 变化 | 为 bs = 1, 2, 4, 8, 16, 32, …, 512 各录制一张 CUDA Graph | [model_runner.py](../nanovllm/engine/model_runner.py#L234) |
-| 公共前缀 | 对 block 做链式 xxhash，配合引用计数共享 block | [block_manager.py `can_allocate` / `hash_blocks`](../nanovllm/engine/block_manager.py#L58) |
-| KV 容量规划 | 根据 warmup 测得的峰值显存，计算 `num_kvcache_blocks` | [model_runner.py `warmup_model`](../nanovllm/engine/model_runner.py#L91) |
+| 组 batch 的粒度 | 每个 step 调度一次（iteration-level） | [llm_engine.py `step`](../../nanovllm/engine/llm_engine.py#L49-L55) |
+| 序列长度不一 | 拼成一维 batch，配合 `cu_seqlens`；prefill 用 `flash_attn_varlen_func` | [model_runner.py `prepare_prefill`](../../nanovllm/engine/model_runner.py#L129-L170) |
+| decode 时各序列上下文长度不同 | `context_lens` + `block_tables`，调用 `flash_attn_with_kvcache` | [model_runner.py `prepare_decode`](../../nanovllm/engine/model_runner.py#L172-L188) |
+| KV 显存管理 | 每个 block 256 个 token，用 block table 做逻辑块到物理块的映射 | [block_manager.py](../../nanovllm/engine/block_manager.py) |
+| 显存耗尽 | 踢掉最晚加入的序列，释放它的 block，之后重新 prefill | [scheduler.py `preempt`](../../nanovllm/engine/scheduler.py#L75) |
+| 调度策略 | prefill 优先，不混批；受 `max_num_seqs` 和 `max_num_batched_tokens` 两个预算约束 | [scheduler.py `schedule`](../../nanovllm/engine/scheduler.py#L25-L73) |
+| 超长 prompt | chunked prefill（只允许 batch 中第一条序列被切块） | [scheduler.py](../../nanovllm/engine/scheduler.py#L42) |
+| batch size 变化 | 为 bs = 1, 2, 4, 8, 16, 32, …, 512 各录制一张 CUDA Graph | [model_runner.py](../../nanovllm/engine/model_runner.py#L234) |
+| 公共前缀 | 对 block 做链式 xxhash，配合引用计数共享 block | [block_manager.py `can_allocate` / `hash_blocks`](../../nanovllm/engine/block_manager.py#L58) |
+| KV 容量规划 | 根据 warmup 测得的峰值显存，计算 `num_kvcache_blocks` | [model_runner.py `warmup_model`](../../nanovllm/engine/model_runner.py#L91) |
 
 ## 4. 设计问题清单（小结）
 
@@ -156,21 +156,21 @@ nano-vllm 在约 1200 行代码里覆盖了这五个维度的核心做法。它*
 ### 分层的几条核心原则
 
 1. **调度层只管 CPU 上的逻辑状态，执行层只管 GPU 资源。** `Scheduler` 和 `BlockManager` 里只有 Python 列表和整数，例如 block id、token 数，不碰任何张量。`ModelRunner` 则只负责把这些整数翻译成 GPU 张量（`slot_mapping`、`block_tables` 等）并执行前向。两者通过 `Sequence` 对象交接。这样调度逻辑可以单独理解和测试，执行层也不需要关心调度策略。
-2. **模型代码不感知 batch 结构。** `Qwen3` 的网络结构和层的写法与 HuggingFace 版基本一致，`forward` 只接收 `input_ids` 和 `positions`。batch 的边界、KV 写入位置、block table 等元数据，通过全局 [Context](../nanovllm/utils/context.py) 直接传给最底层的 `Attention` 和 `LMHead`，中间各层不需要修改函数签名。详见下文的[模型层与 Context](#模型层与-context为什么模型不感知-batch-结构)一节。
+2. **模型代码不感知 batch 结构。** `Qwen3` 的网络结构和层的写法与 HuggingFace 版基本一致，`forward` 只接收 `input_ids` 和 `positions`。batch 的边界、KV 写入位置、block table 等元数据，通过全局 [Context](../../nanovllm/utils/context.py) 直接传给最底层的 `Attention` 和 `LMHead`，中间各层不需要修改函数签名。详见下文的[模型层与 Context](#模型层与-context为什么模型不感知-batch-结构)一节。
 3. **并行策略封装在算子内部。** 张量并行的切分与通信都在 `ColumnParallelLinear`、`RowParallelLinear`、`VocabParallelEmbedding` 这些算子里完成，模型层看不到 `all_reduce`。
-4. **权重怎么切分由算子自己决定。** 每个参数都挂着自己的 `weight_loader`。[loader.py](../nanovllm/utils/loader.py) 只负责遍历 safetensors 文件，通过 `packed_modules_mapping` 把 `q_proj`/`k_proj`/`v_proj` 映射到合并后的 `qkv_proj` 的对应分片，具体如何切分由参数自己的 `weight_loader` 完成。
+4. **权重怎么切分由算子自己决定。** 每个参数都挂着自己的 `weight_loader`。[loader.py](../../nanovllm/utils/loader.py) 只负责遍历 safetensors 文件，通过 `packed_modules_mapping` 把 `q_proj`/`k_proj`/`v_proj` 映射到合并后的 `qkv_proj` 的对应分片，具体如何切分由参数自己的 `weight_loader` 完成。
 
 ## 2. 各层职责详解
 
 ### ① 接口层
 
-- [`LLM`](../nanovllm/llm.py) 只是 `LLMEngine` 的别名，API 和 vLLM 保持一致。
-- [`SamplingParams`](../nanovllm/sampling_params.py) 有三个字段：`temperature`、`max_tokens`、`ignore_eos`。`generate` 可以给每条请求传入不同的参数。
+- [`LLM`](../../nanovllm/llm.py) 只是 `LLMEngine` 的别名，API 和 vLLM 保持一致。
+- [`SamplingParams`](../../nanovllm/sampling_params.py) 有三个字段：`temperature`、`max_tokens`、`ignore_eos`。`generate` 可以给每条请求传入不同的参数。
 - 只支持**离线批量推理**：一次性提交所有 prompt，阻塞到全部完成后返回。没有在线服务和流式输出。
 
 ### ② 引擎层：LLMEngine
 
-[llm_engine.py](../nanovllm/engine/llm_engine.py) 负责把各个组件串起来：
+[llm_engine.py](../../nanovllm/engine/llm_engine.py) 负责把各个组件串起来：
 
 - **初始化**：构建 `Config`；为 rank 1 到 N-1 各 `spawn` 一个 `ModelRunner` 进程；在本进程中创建 rank 0 的 `ModelRunner`；加载 tokenizer；最后创建 `Scheduler`。
   - 顺序很重要：`Scheduler` 需要 `config.num_kvcache_blocks`，而这个值是 rank 0 的 `ModelRunner` 在测量显存之后才写入 config 的。
@@ -184,13 +184,13 @@ nano-vllm 在约 1200 行代码里覆盖了这五个维度的核心做法。它*
 
 | 组件 | 职责 |
 |---|---|
-| [`Sequence`](../nanovllm/engine/sequence.py) | 一条请求的全部状态：`token_ids`、`status`（WAITING/RUNNING/FINISHED）、`block_table`、`num_cached_tokens`（已写入 KV cache 的 token 数）、`num_scheduled_tokens`（本步要算的 token 数）、采样参数。实现了自定义的 `__getstate__`：decode 阶段只序列化最后一个 token，减少跨进程传输的数据量。详见 [Sequence.md](Sequence.md)。 |
-| [`BlockManager`](../nanovllm/engine/block_manager.py) | 管理 KV block 的分配与回收：空闲队列、引用计数、prefix cache 的 hash 表。主要接口有 `can_allocate`/`allocate`（prefill）、`can_append`/`may_append`（decode）、`deallocate`（结束或被抢占）、`hash_blocks`（为写满的 block 登记 hash）。 |
-| [`Scheduler`](../nanovllm/engine/scheduler.py) | 维护 `waiting` 和 `running` 两个队列。`schedule()` 决定本步跑哪些序列、各跑多少 token，并返回本步是 prefill 还是 decode；`postprocess()` 追加采样结果、判断是否结束、回收资源。 |
+| [`Sequence`](../../nanovllm/engine/sequence.py) | 一条请求的全部状态：`token_ids`、`status`（WAITING/RUNNING/FINISHED）、`block_table`、`num_cached_tokens`（已写入 KV cache 的 token 数）、`num_scheduled_tokens`（本步要算的 token 数）、采样参数。实现了自定义的 `__getstate__`：decode 阶段只序列化最后一个 token，减少跨进程传输的数据量。详见 [Sequence.md](Sequence.md)。 |
+| [`BlockManager`](../../nanovllm/engine/block_manager.py) | 管理 KV block 的分配与回收：空闲队列、引用计数、prefix cache 的 hash 表。主要接口有 `can_allocate`/`allocate`（prefill）、`can_append`/`may_append`（decode）、`deallocate`（结束或被抢占）、`hash_blocks`（为写满的 block 登记 hash）。 |
+| [`Scheduler`](../../nanovllm/engine/scheduler.py) | 维护 `waiting` 和 `running` 两个队列。`schedule()` 决定本步跑哪些序列、各跑多少 token，并返回本步是 prefill 还是 decode；`postprocess()` 追加采样结果、判断是否结束、回收资源。 |
 
 ### ④ 执行层：ModelRunner
 
-[model_runner.py](../nanovllm/engine/model_runner.py) 是 GPU 资源的唯一持有者。每个 TP rank 各有一个实例。更详细的设计分析见 [ModelRunner.md](ModelRunner.md)。
+[model_runner.py](../../nanovllm/engine/model_runner.py) 是 GPU 资源的唯一持有者。每个 TP rank 各有一个实例。更详细的设计分析见 [ModelRunner.md](ModelRunner.md)。
 
 **启动阶段**（`__init__`）：
 
@@ -216,7 +216,7 @@ prepare_prefill / prepare_decode   把 Sequence 列表翻译成张量，并写�
 
 ### ⑤ 模型层：Qwen3
 
-[qwen3.py](../nanovllm/models/qwen3.py) 的结构是标准的 decoder-only Transformer：
+[qwen3.py](../../nanovllm/models/qwen3.py) 的结构是标准的 decoder-only Transformer：
 
 ```
 Qwen3ForCausalLM
@@ -300,7 +300,7 @@ ParallelLMHead.forward(x):
 
 KV cache 也不通过参数传递：`allocate_kv_cache` 启动时直接把 cache 张量挂到每个 `Attention` 模块的 `k_cache` / `v_cache` 属性上。
 
-对应代码：写入在 [model_runner.py `prepare_prefill`](../nanovllm/engine/model_runner.py#L169) / [`prepare_decode`](../nanovllm/engine/model_runner.py#L187)，读取在 [attention.py](../nanovllm/layers/attention.py#L60) 和 [embed_head.py](../nanovllm/layers/embed_head.py)，每步结束由 [`run`](../nanovllm/engine/model_runner.py#L214) 中的 `reset_context()` 清空。
+对应代码：写入在 [model_runner.py `prepare_prefill`](../../nanovllm/engine/model_runner.py#L169) / [`prepare_decode`](../../nanovllm/engine/model_runner.py#L187)，读取在 [attention.py](../../nanovllm/layers/attention.py#L60) 和 [embed_head.py](../../nanovllm/layers/embed_head.py)，每步结束由 [`run`](../../nanovllm/engine/model_runner.py#L214) 中的 `reset_context()` 清空。
 
 **好处：**
 
@@ -311,36 +311,36 @@ KV cache 也不通过参数传递：`allocate_kv_cache` 启动时直接把 cache
 **代价：**
 
 1. 全局隐式状态：读模型代码时看不出 `Attention` 依赖外部先调用 `set_context`；一个进程同一时间只能执行一次前向。
-2. 与 CUDA Graph 的配合：Graph 录制的是固定显存地址，decode 时 Context 里的张量必须是固定缓冲区 `graph_vars` 的切片，replay 前要把新数据拷进去（[model_runner.py `run_model`](../nanovllm/engine/model_runner.py#L197-L212)），不能每步新建张量。
+2. 与 CUDA Graph 的配合：Graph 录制的是固定显存地址，decode 时 Context 里的张量必须是固定缓冲区 `graph_vars` 的切片，replay 前要把新数据拷进去（[model_runner.py `run_model`](../../nanovllm/engine/model_runner.py#L197-L212)），不能每步新建张量。
 
 #### 新增一个模型需要做什么
 
 模型内部用 `layers/` 的组件搭建即可，但目前还有两处需要处理：
 
-1. **模型类的选择**：[model_runner.py](../nanovllm/engine/model_runner.py#L12) 直接 import 并实例化 `Qwen3ForCausalLM`，是写死的。新增模型时，需要在这里根据 `hf_config`（例如 `architectures` 字段）分发到对应的模型类。
-2. **权重映射**：在模型类上定义 `packed_modules_mapping`，把 checkpoint 中分开的 `q_proj`/`k_proj`/`v_proj`、`gate_proj`/`up_proj` 映射到合并后参数的对应分片，[loader.py](../nanovllm/utils/loader.py) 据此调用各参数的 `weight_loader`。
+1. **模型类的选择**：[model_runner.py](../../nanovllm/engine/model_runner.py#L12) 直接 import 并实例化 `Qwen3ForCausalLM`，是写死的。新增模型时，需要在这里根据 `hf_config`（例如 `architectures` 字段）分发到对应的模型类。
+2. **权重映射**：在模型类上定义 `packed_modules_mapping`，把 checkpoint 中分开的 `q_proj`/`k_proj`/`v_proj`、`gate_proj`/`up_proj` 映射到合并后参数的对应分片，[loader.py](../../nanovllm/utils/loader.py) 据此调用各参数的 `weight_loader`。
 
 ### ⑥ 算子层
 
 | 文件 | 内容 |
 |---|---|
-| [attention.py](../nanovllm/layers/attention.py) | `store_kvcache`（Triton kernel，按 `slot_mapping` 把 K/V 写入分页 cache，遇到 -1 跳过）；prefill 调用 `flash_attn_varlen_func`（有 prefix cache 时传入 `block_table`，直接从 cache 读 K/V），decode 调用 `flash_attn_with_kvcache` |
-| [linear.py](../nanovllm/layers/linear.py) | `Replicated`、`ColumnParallel`、`MergedColumnParallel`、`QKVParallel`、`RowParallel` 五种线性层，各自实现 `weight_loader` |
-| [embed_head.py](../nanovllm/layers/embed_head.py) | 按词表切分的 Embedding 和 LMHead；prefill 时只取每条序列最后一个位置计算 logits |
-| [layernorm.py](../nanovllm/layers/layernorm.py) | RMSNorm，以及融合了残差相加的版本（`torch.compile`） |
-| [rotary_embedding.py](../nanovllm/layers/rotary_embedding.py) | 预先算好 cos/sin 表，按 `positions` 查表；用 `lru_cache` 让所有层共享同一个实例 |
-| [activation.py](../nanovllm/layers/activation.py) | SiLU(gate) × up |
-| [sampler.py](../nanovllm/layers/sampler.py) | temperature 缩放加指数分布采样 |
+| [attention.py](../../nanovllm/layers/attention.py) | `store_kvcache`（Triton kernel，按 `slot_mapping` 把 K/V 写入分页 cache，遇到 -1 跳过）；prefill 调用 `flash_attn_varlen_func`（有 prefix cache 时传入 `block_table`，直接从 cache 读 K/V），decode 调用 `flash_attn_with_kvcache` |
+| [linear.py](../../nanovllm/layers/linear.py) | `Replicated`、`ColumnParallel`、`MergedColumnParallel`、`QKVParallel`、`RowParallel` 五种线性层，各自实现 `weight_loader` |
+| [embed_head.py](../../nanovllm/layers/embed_head.py) | 按词表切分的 Embedding 和 LMHead；prefill 时只取每条序列最后一个位置计算 logits |
+| [layernorm.py](../../nanovllm/layers/layernorm.py) | RMSNorm，以及融合了残差相加的版本（`torch.compile`） |
+| [rotary_embedding.py](../../nanovllm/layers/rotary_embedding.py) | 预先算好 cos/sin 表，按 `positions` 查表；用 `lru_cache` 让所有层共享同一个实例 |
+| [activation.py](../../nanovllm/layers/activation.py) | SiLU(gate) × up |
+| [sampler.py](../../nanovllm/layers/sampler.py) | temperature 缩放加指数分布采样 |
 
 ### 横切模块
 
-- [Config](../nanovllm/config.py)：模型路径、`max_num_batched_tokens`、`max_num_seqs`、`max_model_len`、`gpu_memory_utilization`、`tensor_parallel_size`、`enforce_eager`、`kvcache_block_size`。其中 `num_kvcache_blocks` 和 `eos` 在运行时才写入。
-- [Context](../nanovllm/utils/context.py)：一个全局 dataclass，保存本步的 `is_prefill`、`cu_seqlens_q/k`、`max_seqlen_q/k`、`slot_mapping`、`context_lens`、`block_tables`。在执行层写入，在算子层读取。
-- [loader](../nanovllm/utils/loader.py)：遍历 safetensors 文件，把权重分发给各参数的 `weight_loader`。
+- [Config](../../nanovllm/config.py)：模型路径、`max_num_batched_tokens`、`max_num_seqs`、`max_model_len`、`gpu_memory_utilization`、`tensor_parallel_size`、`enforce_eager`、`kvcache_block_size`。其中 `num_kvcache_blocks` 和 `eos` 在运行时才写入。
+- [Context](../../nanovllm/utils/context.py)：一个全局 dataclass，保存本步的 `is_prefill`、`cu_seqlens_q/k`、`max_seqlen_q/k`、`slot_mapping`、`context_lens`、`block_tables`。在执行层写入，在算子层读取。
+- [loader](../../nanovllm/utils/loader.py)：遍历 safetensors 文件，把权重分发给各参数的 `weight_loader`。
 
 ## 3. 一个请求的完整生命周期
 
-以 [example.py](../example.py) 中的 `llm.generate(["introduce yourself", ...])` 为例：
+以 [example.py](../../example.py) 中的 `llm.generate(["introduce yourself", ...])` 为例：
 
 ```
 [接口层] generate(prompts, sp)

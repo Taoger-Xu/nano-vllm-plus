@@ -1,6 +1,6 @@
 # Sequence：一条请求在引擎内部的抽象
 
-[sequence.py](../nanovllm/engine/sequence.py) 只有 83 行。用户提交的是一个 prompt 字符串，进入引擎之后，它就变成一个 `Sequence` 对象，并且一直以这个对象的形式存在，直到生成结束。
+[sequence.py](../../nanovllm/engine/sequence.py) 只有 83 行。用户提交的是一个 prompt 字符串，进入引擎之后，它就变成一个 `Sequence` 对象，并且一直以这个对象的形式存在，直到生成结束。
 
 本文先按用途把字段分组，再用一个例子跟踪每个字段在请求生命周期中的变化，最后说明跨进程序列化的设计，以及代码中的一个潜在问题。
 
@@ -149,7 +149,7 @@ append_token(g2) → num_tokens = 9，num_completion_tokens = 3 == max_tokens
 
 ## 四、`__getstate__`：跨进程时只传必要的数据
 
-张量并行时，rank 0 每步都要把 `seqs` 用 pickle 序列化，经共享内存传给其他 rank（见 [ModelRunner.md](ModelRunner.md)）。[sequence.py:72-83](../nanovllm/engine/sequence.py#L72-L83)：
+张量并行时，rank 0 每步都要把 `seqs` 用 pickle 序列化，经共享内存传给其他 rank（见 [ModelRunner.md](ModelRunner.md)）。[sequence.py:72-83](../../nanovllm/engine/sequence.py#L72-L83)：
 
 ```python
 def __getstate__(self):
@@ -188,7 +188,7 @@ def __setstate__(self, state):
 
 ## 五、潜在问题：子进程中的 `block_size`
 
-`block_size` 是**类属性**，默认值为 256（[sequence.py:15](../nanovllm/engine/sequence.py#L15)）。[llm_engine.py:21](../nanovllm/engine/llm_engine.py#L21) 在主进程中把它改成配置值：`Sequence.block_size = config.kvcache_block_size`。
+`block_size` 是**类属性**，默认值为 256（[sequence.py:15](../../nanovllm/engine/sequence.py#L15)）。[llm_engine.py:21](../../nanovllm/engine/llm_engine.py#L21) 在主进程中把它改成配置值：`Sequence.block_size = config.kvcache_block_size`。
 
 但张量并行的子进程是用 `spawn` 方式启动的，会重新 import 模块，所以子进程中的 `Sequence.block_size` 仍然是默认的 256。而子进程的 `prepare_decode` 会用 `seq.last_block_num_tokens` 计算写入位置，这个属性依赖 `block_size`。
 

@@ -1,6 +1,6 @@
 # Scheduler 设计
 
-[scheduler.py](../nanovllm/engine/scheduler.py) 只有 92 行，但做了一连串设计取舍。本文先说它在系统中的位置，再按"设计一个调度器必须回答的问题"逐条拆解：每个问题有哪些做法、nano-vllm 选了哪种、为什么这样选、代价是什么。
+[scheduler.py](../../nanovllm/engine/scheduler.py) 只有 92 行，但做了一连串设计取舍。本文先说它在系统中的位置，再按"设计一个调度器必须回答的问题"逐条拆解：每个问题有哪些做法、nano-vllm 选了哪种、为什么这样选、代价是什么。
 
 块分配、chunked prefill 的实现细节见 [block.md](block.md) 和 [PagedAttention.md](PagedAttention.md)，这里只从调度策略的角度提及。整体架构见 [overview.md](overview.md)。
 
@@ -62,7 +62,7 @@ LLMEngine.step()
 | 分开执行，decode 优先 | decode 延迟平稳 | 新请求的首 token 延迟（TTFT）变差；batch 较小，吞吐下降 |
 | 混合执行（vLLM v1、Sarathi-Serve） | 吞吐和延迟兼顾 | attention 要同时处理两种情况；混合 batch 难以使用 CUDA Graph；调度逻辑复杂 |
 
-**nano-vllm 的选择**：分开执行，prefill 优先（[scheduler.py:29-55](../nanovllm/engine/scheduler.py#L29-L55)）：
+**nano-vllm 的选择**：分开执行，prefill 优先（[scheduler.py:29-55](../../nanovllm/engine/scheduler.py#L29-L55)）：
 
 ```python
 # prefill
@@ -121,7 +121,7 @@ if remaining < num_tokens and scheduled_seqs: break       # 放不下，而且�
 
 ### 问题 6：太长的 prompt 怎么办？
 
-**nano-vllm 的选择**：chunked prefill，并且只允许 batch 中的第一条序列被切块（[scheduler.py:42](../nanovllm/engine/scheduler.py#L42)）。
+**nano-vllm 的选择**：chunked prefill，并且只允许 batch 中的第一条序列被切块（[scheduler.py:42](../../nanovllm/engine/scheduler.py#L42)）。
 
 - 只有当一条序列**独占整个 token 预算仍然放不下**时才会切块。这样每一步最多只有一条"算了一半"的序列，状态最容易管理。
 - 没算完的序列不出队，下一步仍然排在队头，继续算下一段。这也是严格 FCFS 带来的结果。
@@ -136,7 +136,7 @@ if remaining < num_tokens and scheduled_seqs: break       # 放不下，而且�
 | prefill（接纳新请求） | **等待**：不接纳，也不抢占别人 | 新请求还没开始算，等待的代价最小 |
 | decode（已在运行的序列需要新块） | **抢占**：踢掉其他序列 | 不能让正在运行的序列卡住 |
 
-**抢占时选谁？** [scheduler.py:58-65](../nanovllm/engine/scheduler.py#L58-L65)：
+**抢占时选谁？** [scheduler.py:58-65](../../nanovllm/engine/scheduler.py#L58-L65)：
 
 ```python
 seq = self.running.popleft()                 # 按顺序处理 running 中的序列
@@ -152,11 +152,11 @@ else:                                        # while 正常结束（没有 break
 
 - **选队尾（LIFO）**：队尾是最晚进入 running 的序列，通常已生成的 token 最少，重新计算的代价最低。同时也符合 FCFS 的公平原则：先来的请求优先保住。
 - **抢占自己**：如果其他序列都被抢光了还是不够，就把自己也放回 waiting。这时 `while ... else` 的 `else` 分支不会执行，这条序列不进入本步的 batch。
-- **抢占方式选择重算（recompute），而不是换出（swap）**：[preempt](../nanovllm/engine/scheduler.py#L75-L79) 直接释放所有块，把序列插回 `waiting` 队头，并标记 `is_prefill = True`。重新调度时，**prompt 加上已生成的 token 会一起作为 prefill 输入**重新计算。因为 `num_prompt_tokens` 没有变，已生成 token 的计数也不受影响。不做 swap 可以省掉 CPU 内存管理和数据搬运的逻辑；而且被释放的块进入 FREE_CACHED 状态，重新调度时很可能命中 prefix cache，重算的代价往往比看上去小。
+- **抢占方式选择重算（recompute），而不是换出（swap）**：[preempt](../../nanovllm/engine/scheduler.py#L75-L79) 直接释放所有块，把序列插回 `waiting` 队头，并标记 `is_prefill = True`。重新调度时，**prompt 加上已生成的 token 会一起作为 prefill 输入**重新计算。因为 `num_prompt_tokens` 没有变，已生成 token 的计数也不受影响。不做 swap 可以省掉 CPU 内存管理和数据搬运的逻辑；而且被释放的块进入 FREE_CACHED 状态，重新调度时很可能命中 prefix cache，重算的代价往往比看上去小。
 
 ### 问题 8：running 队列的顺序怎么维护？
 
-decode 分支用 `popleft` 依次取出序列，最后用 `extendleft(reversed(scheduled_seqs))` 把它们放回去（[scheduler.py:72](../nanovllm/engine/scheduler.py#L72)）：
+decode 分支用 `popleft` 依次取出序列，最后用 `extendleft(reversed(scheduled_seqs))` 把它们放回去（[scheduler.py:72](../../nanovllm/engine/scheduler.py#L72)）：
 
 ```
 调度前：running = [A, B, C, D, E]，max_num_seqs = 3
@@ -172,7 +172,7 @@ extendleft(reversed([A,B,C])) → running = [A, B, C, D, E]   ← 原顺序不�
 
 ### 问题 9：每一步结束后怎么推进状态？
 
-[postprocess](../nanovllm/engine/scheduler.py#L81-L92) 对本步的每条序列依次执行：
+[postprocess](../../nanovllm/engine/scheduler.py#L81-L92) 对本步的每条序列依次执行：
 
 ```
 ① hash_blocks             登记本步写满的块（prefix cache）
