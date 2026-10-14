@@ -1,15 +1,23 @@
 # 扩展二：让 nano-vllm 支持推测解码（Speculative Decoding）
 
-本文讨论如何在当前 nano-vllm 的架构上支持推测解码。内容分四部分：
+本文是在当前 nano-vllm 上实现推测解码的设计文档。目标是用**一套统一的框架**同时支持两种草稿来源：
 
-1. 推测解码的原理，以及它为什么能加速；
-2. 它对引擎每一层提出了哪些新要求；
-3. 参考项目 [nano-vLLM-MS2](https://github.com/banfeb/nano-vLLM-MS2)（下文简称 **MS2**）的实现；
-4. 在当前项目中落地时的架构设计与优化方向。
+- **n-gram（prompt lookup）**：从上下文中查找重复片段作为草稿，零额外显存；
+- **草稿小模型（draft model）**：用同系列的小模型（如 Qwen3-0.6B）为大模型（如 Qwen3-8B）打草稿。
+
+两种方法共用同一套调度、验证、拒绝采样和后处理，只在"草稿从哪里来"这一步不同，通过配置切换。
+
+内容分为：
+
+1. 原理：为什么能加速，怎样保证输出分布不变；
+2. 设计目标，以及推测解码对引擎各层提出的新要求；
+3. 配置设计；
+4. 整体架构；
+5. 各组件的详细设计；
+6. 设计取舍：考虑过但没有采用的方案；
+7. 与现有机制的配合、文件改动清单、实现顺序。
 
 阅读前建议先看 [basic/Scheduler.md](../basic/Scheduler.md)、[basic/block.md](../basic/block.md) 和 [basic/Sequence.md](../basic/Sequence.md)。推测解码几乎会碰到这几个组件的每一个设计点。
-
-> 说明：MS2 基于较早版本的 nano-vllm（chunked prefill 重构之前），本文只借鉴它的设计思路，落地方案以当前项目的代码为准。对 MS2 的分析来自阅读源码，没有在 GPU 上实际运行。
 
 ---
 
@@ -19,270 +27,675 @@
 
 [basic/ContinuousBatching.md](../basic/ContinuousBatching.md) 中讲过：decode 阶段每步只生成 1 个 token，却要把整套权重从显存读一遍，瓶颈在**访存**而不在计算。
 
-所以，**一次前向算 1 个 token 和算 4 个 token，耗时几乎一样**。推测解码利用了这一点：
+所以，**一次前向算 1 个 token 和算 K+1 个 token，耗时几乎一样**。推测解码利用了这一点：
 
 ```
 普通 decode：  每步输入 1 个 token → 产出 1 个 token
 
-推测解码：     ① 用一个很便宜的方法"猜"出后面 K 个 token（draft）
-              ② 把"最后一个 token + K 个 draft"一起送进大模型，一次前向得到 K+1 个位置的 logits（verify）
-              ③ 从前往后逐个检查 draft，接受连续的一段，在第一个被拒绝的位置补一个 token
-              → 每步产出 1 ~ K+1 个 token，而前向的耗时和普通 decode 差不多
+推测解码：     ① propose：用一个便宜的方法"猜"出后面 K 个 token（草稿）
+              ② verify： 把"最后一个 token + K 个草稿"一起送进大模型，一次前向得到 K+1 个位置的分布
+              ③ accept： 从前往后逐个检查草稿，接受连续的一段，在第一个被拒绝的位置补一个 token
+              → 每步产出 1 ~ K+1 个 token，而验证的耗时和普通 decode 差不多
 ```
 
-猜 draft 的方法有很多种：
+### 2. 两种草稿来源
 
-| 方法 | 做法 | 代价 |
+| | n-gram | 草稿小模型 |
 |---|---|---|
-| **n-gram（prompt lookup）** | 在已有的上下文中找和"最后几个 token"相同的片段，把它后面的 token 当作 draft | 几乎为零，纯 CPU 字符串匹配 |
-| 小模型（draft model） | 用同系列的小模型自回归生成 K 个 token | 需要第二个模型、第二份 KV cache |
-| EAGLE / MTP | 在大模型的 hidden states 上接一个轻量的预测头 | 需要额外训练的权重 |
+| 做法 | 在已有上下文中找和"最后 n 个 token"相同的片段，把它后面的 token 当作草稿 | 小模型自回归采样 K 个 token |
+| 草稿分布 q | one-hot（草稿是确定的） | 完整的词表分布 |
+| 额外显存 | 无 | 小模型权重 + 它自己的 KV cache |
+| 每步额外开销 | CPU 上的字符串匹配 | K 次小模型前向 |
+| 前提 | 无 | 两个模型**词表一致**（同一个 tokenizer） |
+| 适合的场景 | 输出大量复制输入：改代码、摘要、基于检索内容的问答 | 通用，开放式生成也有较高的接受率 |
 
-MS2 实现的是 **n-gram**。它对**输出和输入高度重合**的任务效果最好，比如代码修改、摘要、基于检索内容的问答。
+草稿小模型是推测解码最原始的形式（Leviathan et al. 2023；Chen et al. 2023）。n-gram 可以看作它的特例：草稿分布 q 退化为 one-hot。正因为如此，两者可以共用同一套验证逻辑。
 
-### 2. 怎样保证输出分布不变：拒绝采样
+### 3. 怎样保证输出分布不变：拒绝采样
 
-推测解码的关键性质是：**最终输出的分布和只用大模型逐个采样完全相同**。做法如下（设第 i 个位置，大模型分布为 p，draft 分布为 q，draft token 为 d）：
+设第 i 个位置大模型的分布为 p，草稿分布为 q，草稿 token 为 d：
 
 ```
 以概率 min(1, p(d) / q(d)) 接受 d
 若拒绝：从修正分布 r(x) ∝ max(0, p(x) − q(x)) 中采样一个 token 作为替代，本轮到此结束
-若 K 个 draft 全部被接受：再从最后一个位置的 p 中额外采样一个 token（bonus token）
+若 K 个草稿全部被接受：再从最后一个位置的 p 中额外采样一个 token（bonus token）
 ```
 
-对 n-gram 来说，draft 是确定性的，相当于 q 是集中在 d 上的 one-hot 分布，上面的公式退化为：
+可以证明，这样得到的每个 token 都服从 p，也就是和只用大模型逐个采样**完全同分布**。
+
+n-gram 的 q 是 one-hot（`q(d) = 1`），公式自然退化为：
 
 - 接受概率就是 **p(d)**；
 - 拒绝后从 **p 去掉 d 之后重新归一化**的分布中采样。
 
-MS2 的 [docs/Speculative-Decoding.md](https://github.com/banfeb/nano-vLLM-MS2/blob/main/docs/Speculative-Decoding.md) 用"The capital of France is …"的例子，逐步演示了接受、拒绝和修正分布的计算过程，可以作为补充阅读。
+所以统一的拒绝采样器只需要做一件事：**没有 q 时，把它当作 one-hot**（见第五节第 3 小节）。
 
-### 3. 收益估算
+### 4. 收益估算
 
-设每个 draft 被接受的概率都是 α（简化为互相独立），每步提议 K 个 draft，则每步期望产出的 token 数为：
+设每个草稿被接受的概率都是 α（简化为互相独立），每步提议 K 个草稿，则每步期望产出的 token 数为：
 
 ```
 E[tokens/step] = 1 + α + α² + … + α^K = (1 − α^(K+1)) / (1 − α)
 ```
 
-例如 α = 0.6、K = 3 时约为 2.2，也就是理想情况下 decode 步数减少到原来的 45% 左右。实际收益还要扣除两部分开销：
+每一步也更贵了。设生成一个草稿 token 的耗时是大模型一次 decode 的 c 倍，batch 较小时验证的耗时约等于一次普通 decode，则：
 
-- **验证的开销**：batch 小时，前向的耗时由访存决定，多算几个 token 几乎不花时间；但 **batch 很大时，decode 也会逐渐变成计算瓶颈**，一次验证 K+1 个 token 的耗时会明显上升，收益随之缩小。
-- **生成 draft 的开销**：n-gram 在 CPU 上运行，每步都会增加一些耗时。
+```
+一步的耗时 ≈ (K·c + 1) × T_decode
+加速比     ≈ E[tokens/step] / (K·c + 1)
+```
 
-所以推测解码在**小 batch、对延迟敏感**的场景中收益最大。MS2 报告在 Qwen3-0.6B 上吞吐从 1418 提升到 1997 tok/s（+40.8%）。这个数字和 prompt 内容、batch 大小、K 的取值都密切相关，不宜直接推广。
+例如 α = 0.7、K = 5 时，E ≈ 2.94：
+
+- **n-gram**：c ≈ 0，理论加速约 2.9×，前提是真能找到匹配（α 才会这么高）；
+- **0.6B 草稿 + 8B 目标**：按参数量算 c 约 0.075，但小模型的耗时更多由 kernel 启动等固定开销决定，c 大约在 0.1 ~ 0.2，加速约 1.5 ~ 2.0×。
+
+batch 增大后，有两项开销会变得显著：
+
+- **验证**：decode 逐渐从访存瓶颈变成计算瓶颈，一次验证 B·(K+1) 个 token 的耗时明显上升，被拒绝的草稿白白占用了算力；
+- **草稿模型的 K 次前向是串行的**，batch 越大越贵。
+
+所以推测解码在**小 batch、对延迟敏感**的场景中收益最大，大 batch 时甚至会变慢。设计中要支持**按 batch 大小自动关闭**（见第五节第 8 小节），阈值通过实测确定。
 
 ---
 
-## 二、推测解码对引擎各层的要求
+## 二、设计目标与新要求
 
-和 MoE 不同，推测解码**几乎触及每一层**。原因是它打破了 decode 阶段一个隐含的前提："每条序列每步只算 1 个 token，也只产出 1 个 token"。
+### 1. 设计目标
+
+| 目标 | 说明 |
+|---|---|
+| **一套框架，两种方法** | n-gram 和草稿模型共用调度、验证、拒绝采样和后处理，只有 propose 不同 |
+| **配置切换** | 通过一个 `speculative_config` 选择方法和参数；不配置时行为与现在完全相同 |
+| **无损** | 输出分布与不开推测解码时完全一致 |
+| **保持 CUDA Graph** | 验证步和草稿模型的前向都要能录图，否则省下的步数会被 kernel 启动开销吃掉 |
+| **改动最小** | 尽量复用现有的进度字段、`hash_blocks`、decode 的 attention 路径，保持 nano-vllm 简洁的风格 |
+| **保持现有分工** | Scheduler 是唯一修改序列状态的地方；ModelRunner 只读输入、返回结果 |
+
+### 2. 推测解码对引擎各层的要求
+
+推测解码**几乎触及每一层**。原因是它打破了 decode 阶段一个隐含的前提："每条序列每步只算 1 个 token，也只产出 1 个 token"。
 
 | 层 | 原来的前提 | 推测解码之后 |
 |---|---|---|
-| **Sequence** | decode 时 `num_scheduled_tokens = 1` | 每步要计算 1 + k 个 token，但最终只确认其中一部分 |
-| **BlockManager** | 每步最多新增 1 个块（`len % block_size == 1` 时） | 要一次为 1 + k 个 token 预留空间；被拒绝的 token 用过的块要**回滚** |
+| **Config** | 只有一个模型 | 新增推测解码的配置；草稿模型方法需要第二个模型的 hf_config |
+| **Sequence** | decode 时 `num_scheduled_tokens = 1` | 每步计算 1 + K 个 token，但只确认其中一部分 |
+| **BlockManager** | 每步最多新增 1 个块 | 一次为 1 + K 个 token 预留空间 |
 | **prefix cache** | 写满的块一定是有效内容 | 被拒绝的 token 的 KV 也写进了 cache，**绝不能登记 hash** |
-| **Scheduler** | 每步 token 数 = 序列数 | 每步 token 数 = Σ(1 + k_i)，要计入 token 预算；后处理一次追加多个 token，EOS 可能出现在中间 |
-| **ModelRunner** | decode 的 Q 长度为 1，可以用 CUDA Graph | Q 长度为 1 + k，需要新的输入准备逻辑，并且要考虑 CUDA Graph |
-| **LMHead** | prefill 只取最后一个位置，decode 每条序列一行 | 验证时需要**每个位置**的 logits |
-| **Sampler** | 每条序列采样一个 token | 拒绝采样，每条序列输出 1 ~ k+1 个 token |
-| **TP 通信** | 每步传输 `seqs` | 还要把 draft 传给其他 rank |
-| **新组件** | — | Proposer（生成 draft），只需在 rank 0 上运行 |
+| **Scheduler** | 每步 token 数 = 序列数 | 每步 token 数 = B·(1 + K)；后处理一次追加多个 token，EOS 可能出现在中间 |
+| **ModelRunner** | decode 的 Q 长度为 1 | 验证时 Q 长度为 1 + K；草稿模型方法还要管理第二个模型及其 KV cache |
+| **Attention** | decode 时 q 为 `(B, 1, H, D)` | q 为 `(B, q_len, H, D)` |
+| **Sampler** | 每条序列采样一个 token | 草稿模型要返回概率 q；验证时做拒绝采样，每条序列输出 1 ~ K+1 个 token |
+| **TP 通信** | 每步传输 `seqs` | 草稿 token 也要让所有 rank 知道 |
+| **新组件** | — | NgramProposer、RejectionSampler |
 
 ---
 
-## 三、MS2 的实现
+## 三、配置设计
 
-### 1. 一个推测解码 step 的完整流程
+### 1. 使用方式
 
-[llm_engine.py](https://github.com/banfeb/nano-vLLM-MS2/blob/main/nanovllm/engine/llm_engine.py) 的 `step()`：
+沿用 vLLM 的接口风格，用一个 `speculative_config` 参数配置，可以传 dict：
+
+```python
+from nanovllm import LLM, SamplingParams
+
+# 不开启：与现在完全相同
+llm = LLM("~/huggingface/Qwen3-8B")
+
+# n-gram
+llm = LLM("~/huggingface/Qwen3-8B",
+          speculative_config=dict(method="ngram", num_speculative_tokens=4,
+                                  prompt_lookup_min=2, prompt_lookup_max=5))
+
+# 草稿小模型
+llm = LLM("~/huggingface/Qwen3-8B",
+          speculative_config=dict(method="draft_model", model="~/huggingface/Qwen3-0.6B",
+                                  num_speculative_tokens=5))
+```
+
+`LLMEngine.__init__` 会按 `Config` 的字段名过滤 `**kwargs`，所以只要 `Config` 中有 `speculative_config` 这个字段，上面的写法就能直接透传，引擎不需要改。
+
+### 2. 配置类
+
+[config.py](../../nanovllm/config.py) 中新增 `SpeculativeConfig`，并在 `Config` 中增加一个字段：
+
+```python
+@dataclass(slots=True)
+class SpeculativeConfig:
+    method: str = "ngram"                    # "ngram" | "draft_model"
+    num_speculative_tokens: int = 4          # 每步提议的草稿数 K
+    model: str | None = None                 # draft_model：草稿模型路径
+    prompt_lookup_min: int = 2               # ngram：最短匹配长度
+    prompt_lookup_max: int = 5               # ngram：最长匹配长度
+    max_batch_size: int = 32                 # batch 超过它时本步不推测，走普通 decode
+    hf_config: AutoConfig | None = None      # draft_model：草稿模型的 config，自动读取
+
+    def __post_init__(self):
+        assert self.method in ("ngram", "draft_model")
+        assert self.num_speculative_tokens > 0
+        if self.method == "draft_model":
+            self.model = os.path.expanduser(self.model)
+            assert os.path.isdir(self.model)
+            self.hf_config = AutoConfig.from_pretrained(self.model)
+        else:
+            assert 1 <= self.prompt_lookup_min <= self.prompt_lookup_max
+
+
+@dataclass(slots=True)
+class Config:
+    ...
+    speculative_config: SpeculativeConfig | dict | None = None
+
+    def __post_init__(self):
+        ...
+        if isinstance(self.speculative_config, dict):
+            self.speculative_config = SpeculativeConfig(**self.speculative_config)
+        if (spec := self.speculative_config) is not None:
+            k = spec.num_speculative_tokens
+            assert self.max_num_seqs * (1 + k) <= self.max_num_batched_tokens   # 验证步的激活不超过 warmup 测出的峰值
+            assert self.tensor_parallel_size == 1                               # 第一版只支持单卡，见第五节第 10 小节
+            if spec.method == "draft_model":
+                assert spec.hf_config.vocab_size == self.hf_config.vocab_size   # 拒绝采样按 token id 对齐 p 和 q
+```
+
+### 3. 字段说明
+
+| 字段 | 适用方法 | 说明 |
+|---|---|---|
+| `method` | 共用 | 选择草稿来源 |
+| `num_speculative_tokens` | 共用 | K。草稿模型的经验值为 3 ~ 5；n-gram 的草稿几乎免费，可以稍大，但验证的开销随 K 线性增长 |
+| `max_batch_size` | 共用 | 当前 running 的序列数超过它时，本步不推测。默认值需要实测确定（第七节第 3 小节第 6 步） |
+| `model` | draft_model | 草稿模型路径，必须与主模型使用同一个 tokenizer |
+| `prompt_lookup_min` / `prompt_lookup_max` | ngram | 匹配长度的范围，从长到短尝试 |
+| `hf_config` | draft_model | 内部字段，自动从 `model` 读取 |
+
+### 4. 命令行
+
+[example.py](../../example.py) 和 [bench.py](../../bench.py) 增加对应的参数，拼成 dict 传给 `LLM`：
+
+```
+--spec-method {ngram,draft_model}  --num-spec-tokens 4
+--spec-model ~/huggingface/Qwen3-0.6B
+--prompt-lookup-min 2  --prompt-lookup-max 5
+```
+
+---
+
+## 四、整体架构
+
+### 1. 组件关系
+
+```
+                        LLMEngine.step()
+                              │
+            ┌─────────────────┼──────────────────────────┐
+            ▼                 ▼                          ▼
+     Scheduler.schedule   ModelRunner.run / run_spec   Scheduler.postprocess / postprocess_spec
+     ├ 决定本步是否推测     │
+     └ 预留 1+K 个位置      ├─ ① propose ──┬─ method = ngram       → NgramProposer（CPU，rank 0）
+                           │              └─ method = draft_model → 草稿模型 K 次前向（GPU）
+                           │                                        ↑ 两种方法唯一不同的地方
+                           ├─ ② verify   ：大模型一次前向，Q = K+1
+                           └─ ③ accept   ：RejectionSampler（q 为 None 时按 one-hot 处理）
+                                           返回每条序列的 token 列表，不修改 seq
+```
+
+### 2. 一个推测解码 step 的完整流程
+
+```
+LLMEngine.step()
+ │
+ ├─ Scheduler.schedule()
+ │    prefill 分支：不变（草稿模型方法在 ModelRunner 中让两个模型一起 prefill）
+ │    decode 分支：本步是否推测？ → n = 1 + K 或 1
+ │                 每条序列：can_append(seq, n) → may_append(seq, n)，不够时抢占
+ │                 seq.num_scheduled_tokens = n
+ │
+ ├─ 推测步：ModelRunner.call("run_spec", seqs)
+ │    ① propose：得到 draft_ids [B, K]、num_drafts [B]、draft_probs [B, K, V] 或 None
+ │    ② verify： 输入 [last_token, d1..dK]，一次前向得到 B·(K+1) 行 logits
+ │    ③ accept： rank 0 上做拒绝采样
+ │    返回 list[list[int]]：每条序列 = 被接受的草稿 + 1 个修正 / bonus token
+ │
+ └─ Scheduler.postprocess_spec(seqs, token_ids)
+      逐个追加 → 修正 num_scheduled_tokens → hash_blocks → 推进 num_cached_tokens → 追加修正 token
+```
+
+`LLMEngine.step()` 通过 `num_scheduled_tokens` 区分普通 decode 和推测步，不需要新的返回值：
 
 ```python
 seqs, is_prefill = self.scheduler.schedule()
-if not is_prefill and self.scheduler.is_spec_decoding:
-    draft_token_ids = self.model_runner.propose_draft_token_ids(seqs)                  # ① 只在 rank 0 上运行
-    draft_token_ids, reservations = self.scheduler.reserve_spec_decode(seqs, draft_token_ids)   # ② 预留 KV 块
-    token_ids = self.model_runner.call("run_spec_decode", seqs, draft_token_ids, reservations)  # ③ 验证
-    num_decode_tokens = self.scheduler.postprocess_spec_decode(seqs, token_ids, draft_token_ids, reservations)  # ④ 提交
+if is_prefill or seqs[0].num_scheduled_tokens == 1:
+    token_ids = self.model_runner.call("run", seqs, is_prefill)
+    self.scheduler.postprocess(seqs, token_ids, is_prefill)
 else:
-    ...                                                                                 # 原来的路径
+    token_ids = self.model_runner.call("run_spec", seqs)
+    self.scheduler.postprocess_spec(seqs, token_ids)
 ```
-
-prefill 完全不受影响。只有 decode step 改走新路径，原来的 `schedule()` 也基本不变。
-
-### 2. 用一个例子跟踪
-
-设 block_size = 4。某条序列共有 10 个 token `t0..t9`，其中 t0..t8 的 KV 已经写入 cache，t9 是上一步刚生成的。K = 3。
-
-**① propose（n-gram）**：在 `t0..t9` 中找出与末尾最长匹配的片段，取它后面的 3 个 token 作为 draft `[d1, d2, d3]`。
-
-MS2 的 [NgramProposer](https://github.com/banfeb/nano-vLLM-MS2/blob/main/nanovllm/v1/spec_decode/ngram_proposer.py) 把序列反转后用类似 KMP 的方式求最长匹配，长度限制在 `prompt_lookup_min` ~ `prompt_lookup_max` 之间，用 Numba 加速。总 token 数超过 8192 时启用多线程。
-
-**② reserve**：`schedule()` 中的 `may_append` 已经为 t9 准备好了位置。现在还要为 d1..d3 预留位置：
-
-```
-需要写入 KV 的位置：9(t9) 10(d1) 11(d2) 12(d3)
-现有 block_table 覆盖 0..11（3 块），位置 12 需要第 4 块 → 临时分配一个块，记在 reservation 中，暂不加入 block_table
-如果空闲块不够：截短 draft，而不是抢占别的序列
-```
-
-**③ verify**：把这次验证**当作一次很小的 prefill** 来执行：
-
-```
-input_ids = [t9, d1, d2, d3]，positions = 9..12
-cu_seqlens_q 每条序列加 4，cu_seqlens_k 每条序列加 13
-slot_mapping 覆盖位置 9..12（包括临时预留的块）
-→ 走 flash_attn_varlen_func + block_table，和 prefix cache 命中时的 prefill 完全相同
-```
-
-`LMHead` 新增了 `return_all_logits=True` 参数，取出这 4 个位置的 logits，按照 vLLM 的布局重新排列：**先放所有序列的 draft 行，再放所有序列的 bonus 行**：
-
-```
-t9 那一行 → 用来判断 d1      d1 那一行 → 判断 d2      d2 那一行 → 判断 d3      d3 那一行 → bonus token
-```
-
-然后交给 [RejectionSampler](https://github.com/banfeb/nano-vLLM-MS2/blob/main/nanovllm/v1/sample/rejection_sampler.py)，它由三个 Triton kernel 组成：生成均匀随机数、计算拒绝后的替代 token、逐位置判断接受或拒绝。
-
-**④ commit**：假设 d1 被接受、d2 被拒绝，替代 token 为 r2：
-
-```
-输出 [d1, r2] → 依次 append_token，同时检查 EOS 和 max_tokens（停止条件可能出现在中间）
-真正有效的 KV：t9 和 d1 → num_computed_tokens = 10 + 1 = 11
-d2、d3 的 KV 也写进了位置 11、12，但已经无效：
-  - 位置 11 下一步会被 r2 的 KV 覆盖
-  - 第 4 块（只包含位置 12）不再需要 → 释放回空闲队列
-只给 [0, num_computed_tokens) 范围内写满的块登记 hash → 被拒绝的内容永远不会进入 prefix cache
-```
-
-### 3. 关键设计点
-
-| 设计点 | MS2 的做法 | 评价 |
-|---|---|---|
-| **验证走哪条执行路径** | 复用 prefill 的 varlen 路径 | 不需要新的 attention kernel，实现最简单；但不能使用 CUDA Graph（见第四节第 1 点） |
-| **draft 存放在哪里** | 不写入 `Sequence.token_ids`，单独作为参数传给 ModelRunner | Sequence 只保存已确认的内容，回滚时不需要修改 token_ids |
-| **KV 块的预留** | 先临时分配（reservation），验证后再决定保留多少、释放多少 | 预留和提交两步分离，回滚逻辑清晰 |
-| **空间不够时** | 截短 draft，不抢占 | 推测解码只是一种优化，空间不够时退化成普通 decode，比为了它去抢占别的序列更合理 |
-| **prefix cache 的安全性** | 只为有效范围内写满的块登记 hash | 正确。这是最容易出错的地方 |
-| **Proposer 在哪里运行** | 只在 rank 0 上，以普通方法调用（不经过 `call` 广播） | 正确，其他 rank 只需要拿到 draft |
-| **统计指标** | Scheduler 记录 `acceptance_rate`（不含 bonus token） | 便于调试 K 和 n-gram 参数 |
 
 ---
 
-## 四、MS2 实现中值得改进的地方
+## 五、各组件的详细设计
 
-### 1. 验证阶段不能使用 CUDA Graph
+### 1. 统一的 propose 输出
 
-验证复用了 prefill 路径，而 prefill 在当前项目中一律走 eager 模式。MS2 的示例和 benchmark 也都设置了 `enforce_eager=True`。
+无论哪种方法，propose 都输出同样形状的三样东西：
 
-这就产生了矛盾：推测解码要省的就是 decode 的步数，但验证步失去了 decode 最重要的优化手段（CUDA Graph），省下来的部分收益又被 kernel 启动开销吃掉了。
+| 输出 | 形状 | n-gram | 草稿模型 |
+|---|---|---|---|
+| `draft_ids` | `[B, K]` int64 | 匹配到的 token，不足 K 个的部分随便填（例如 0） | 采样出的 K 个 token |
+| `num_drafts` | `[B]` int64 | 每条序列实际的草稿数，0 ~ K | 全部为 K |
+| `draft_probs` | `[B, K, V]` 或 `None` | `None`，表示 one-hot | 每一步采样时的完整分布 q |
 
-**改进：uniform decode 图**（vLLM 采用的做法）
+验证步的形状**永远是 `[B, K+1]`**，草稿不足 K 个的序列用补齐处理（第五节第 9 小节）。这样 verify 的 CUDA Graph 只需要按 batch size 分档，不用关心每条序列有多少草稿。
 
-- 每条序列的 Q 长度统一**补齐到 K+1**。draft 不足 K 个的序列用无效 token 填充，填充位置的 `slot_mapping` 设为 -1（[store_kvcache](../../nanovllm/layers/attention.py) 遇到 -1 会跳过写入），输出直接忽略；
-- 这样输入形状就是规整的 `[bs, K+1]`。`flash_attn_with_kvcache` 本身支持 Q 长度大于 1（加上 causal mask），可以继续沿用 decode 的 attention 路径；
-- 按 batch size 分档录制 `Q 长度 = K+1` 的图，和现有的 `capture_cudagraph` 机制完全一致。
+### 2. n-gram：NgramProposer
 
-代价是填充会浪费一些计算。但 decode 本来就是访存瓶颈，这点浪费通常可以忽略。
+新增 `nanovllm/spec_decode/ngram_proposer.py`。只在 rank 0 上创建和调用；rank 0 的 ModelRunner 和 LLMEngine 在同一个进程中，拿到的是完整的 Sequence 对象，可以直接读 `token_ids`。
 
-### 2. 序列化时总是传输完整的 token_ids
+```python
+class NgramProposer:
 
-MS2 修改了 `Sequence.__getstate__`，**无论 prefill 还是 decode 都传输完整的 `token_ids`**。[basic/Sequence.md](../basic/Sequence.md#四__getstate__跨进程时只传必要的数据) 中分析过，当前项目在 decode 时只传 `last_token`，正是为了控制每步的 IPC 数据量。
+    def __init__(self, k: int, n_min: int, n_max: int):
+        self.k, self.n_min, self.n_max = k, n_min, n_max
 
-验证时，worker 需要的输入只有"最后一个 token + draft"，而 draft 已经作为单独的参数传过去了，所以并不需要完整的历史。此外，共享内存只有 1MB，传输完整历史会让长序列更容易超出限制（见 [basic/ModelRunner.md](../basic/ModelRunner.md)）。
+    def propose(self, seqs: list[Sequence]):
+        draft_ids = torch.zeros(len(seqs), self.k, dtype=torch.int64)
+        num_drafts = torch.zeros(len(seqs), dtype=torch.int64)
+        for i, seq in enumerate(seqs):
+            draft = self.lookup(np.asarray(seq.token_ids))
+            draft_ids[i, :len(draft)] = torch.from_numpy(draft)
+            num_drafts[i] = len(draft)
+        return draft_ids.cuda(non_blocking=True), num_drafts.cuda(non_blocking=True), None
 
-**改进**：保留当前项目的精简序列化方式，draft 单独传输。
+    def lookup(self, tokens: np.ndarray) -> np.ndarray:
+        for n in range(self.n_max, self.n_min - 1, -1):          # 从长到短，长匹配更可靠
+            if len(tokens) <= n:
+                continue
+            windows = sliding_window_view(tokens[:-1], n)         # 不包括末尾自身
+            hits = np.flatnonzero((windows == tokens[-n:]).all(axis=1))
+            if len(hits):
+                start = hits[-1] + n                              # 取最近的一次出现
+                return tokens[start:start + self.k]
+        return tokens[:0]
+```
 
-### 3. 每步的 token 数没有计入预算
+这是最直接的 O(L·n) 写法，符合 nano-vllm 的风格。如果长序列的匹配成为瓶颈，可以换成 KMP 或用 Numba 加速，接口不变。
 
-验证步一共要计算 Σ(1 + k_i) 个 token，但 MS2 的预留逻辑只检查 KV 块够不够，没有检查 token 预算。
+### 3. 统一的拒绝采样：RejectionSampler
 
-[basic/Scheduler.md](../basic/Scheduler.md) 中讲过，`max_num_batched_tokens` 对应 warmup 测出的激活峰值。默认配置下 512 × (1+3) = 2048，远小于 16384，所以不会出问题。但如果 K 设得很大，或者调小了 `max_num_batched_tokens`，就可能超出预留的激活显存。
+新增 `nanovllm/spec_decode/rejection_sampler.py`，只在 rank 0 上运行（logits 只 gather 到 rank 0）。两种方法的差异被收敛到两条规则：
 
-**改进**：在 Config 中加一条断言 `max_num_seqs × (1 + K) ≤ max_num_batched_tokens`，或者在调度时把 Σ(1+k_i) 计入 token 预算。
+- **`draft_probs is None`**：q 按 one-hot 处理，`q(d) = 1`；修正分布为 p 去掉 d；
+- **位置 j ≥ `num_drafts`**（n-gram 草稿不足）：这个位置没有草稿，强制"拒绝"，并且直接从 p 采样，和 bonus token 的处理相同。
 
-### 4. draft 的生成和 GPU 计算是串行的
+```python
+class RejectionSampler(nn.Module):
 
-每个 decode step 都要先在 CPU 上做完 n-gram 匹配，然后才开始 GPU 前向。batch 大、序列长时，匹配本身也要花时间。MS2 用 Numba 多线程缓解了这个问题，但没有消除串行等待。
+    def forward(self, logits, temperatures, draft_ids, num_drafts, draft_probs=None):
+        B, K = draft_ids.shape
+        p = torch.softmax(logits.float() / temperatures.repeat_interleave(K + 1)[:, None], -1).view(B, K + 1, -1)
+        p_d = p[:, :K].gather(2, draft_ids[..., None]).squeeze(-1)                   # p(d)
+        q_d = 1. if draft_probs is None else draft_probs.gather(2, draft_ids[..., None]).squeeze(-1)
+        valid = torch.arange(K, device=p.device) < num_drafts[:, None]               # 有草稿的位置
+        accepted = (torch.rand_like(p_d) * q_d < p_d) & valid                         # rand < p/q
+        num_accepted = accepted.int().cumprod(1).sum(1)                              # 第一个拒绝之后全部作废
 
-**改进**（较复杂）：在 GPU 执行第 t 步的同时，CPU 为第 t+1 步准备 draft。这需要先知道第 t 步的结果，所以通常要配合"异步调度"一起设计，是 vLLM v1 中的做法。对 nano-vllm 来说可以作为后续优化。
+        # 下一个 token 的分布：第一个拒绝的位置，或者 bonus 位置 K
+        rows = torch.arange(B, device=p.device)
+        p_next = p[rows, num_accepted]
+        rejected = num_accepted < num_drafts                                         # 确实拒绝了一个草稿
+        j = num_accepted.clamp(max=K - 1)
+        if draft_probs is None:
+            q_next = F.one_hot(draft_ids[rows, j], p.size(-1)).float()
+        else:
+            q_next = draft_probs[rows, j]
+        residual = (p_next - q_next).clamp_min(0)
+        next_probs = torch.where(rejected[:, None], residual, p_next)               # 没有草稿 / 全部接受：直接用 p
+        next_ids = torch.multinomial(next_probs / next_probs.sum(-1, keepdim=True), 1).squeeze(1)
 
-### 5. draft 长度固定为 K
+        draft_ids, num_accepted, next_ids = draft_ids.tolist(), num_accepted.tolist(), next_ids.tolist()
+        return [draft_ids[i][:num_accepted[i]] + [next_ids[i]] for i in range(B)]
+```
 
-只有在 KV 空间不够时才会截短 draft。实际上，n-gram 对不同的序列、在不同的阶段，命中率差别很大。
+要点：
 
-**改进**：
+- 用 `rand * q < p` 代替 `rand < p / q`，避免除以 0；
+- **温度要一致**：草稿模型采样、计算 q 时使用与大模型相同的 temperature，否则 p/q 的比值没有意义；
+- 当前项目的 `SamplingParams` 不允许 temperature = 0。如果将来支持 greedy，验证就退化为"argmax 是否等于草稿"，可以跳过随机数。
 
-- 根据每条序列最近的接受率，动态调整它的 K；
-- 找不到匹配的序列（draft 为空）仍然按普通 decode 处理，Q 长度为 1。补齐成 uniform decode 时要注意，这种序列不应该拉高整体的填充开销。
+### 4. 草稿模型的 KV cache：与大模型共用一张 block_table
 
-### 6. 其他细节
+```
+                       seq.block_table = [7, 2, 9]（只有一张）
+                                  │
+             ┌────────────────────┴────────────────────┐
+     大模型 kv_cache[:, :, 7]                  草稿模型 draft_kv_cache[:, :, 7]
+     （按大模型的层数、头数）                    （按草稿模型的层数、头数）
+```
 
-- **Proposer 在所有 rank 上都被创建**：`NgramProposer` 的构造函数中会预分配 `(1024, max_model_len)` 的数组，并执行一次预热，但 rank > 0 上它从不会被调用。只在 rank 0 上创建即可。
-- **不支持 greedy 解码**：当前项目的 `SamplingParams` 不允许 temperature = 0。如果将来支持 greedy，验证就退化为"argmax 是否等于 draft"，这时可以完全跳过随机数生成。
+两个模型在每次前向时使用**同一份** `slot_mapping` 和 `block_tables`，各自把 KV 写进自己的池中相同块号的位置。所以：
 
----
+- **BlockManager 完全不知道草稿模型的存在**，分配、释放、抢占只管理一套块；
+- **prefix cache 自动对两个模型生效**：命中的块在两个池中都有该前缀的 KV；
+- **n-gram 方法**没有第二个池，这一节的内容全部跳过。
 
-## 五、在当前项目中的落地设计
+显存规划：`allocate_kv_cache` 中每个块的字节数改为两个模型之和，两个池的块数相同：
 
-当前项目比 MS2 所基于的版本多了 chunked prefill 和 `hash_blocks`，Sequence 的进度字段也不同。下面给出按当前代码调整后的设计。
+```python
+block_bytes = target_block_bytes + draft_block_bytes
+config.num_kvcache_blocks = available // block_bytes
+self.kv_cache = torch.empty(2, target_layers, num_blocks, block_size, target_kv_heads, target_head_dim)
+self.draft_kv_cache = torch.empty(2, draft_layers, num_blocks, block_size, draft_kv_heads, draft_head_dim)
+# 分别绑定到两个模型的 Attention 模块的 k_cache / v_cache
+```
 
-### 1. 核心思路：用现有的进度字段表达"推测"
+这里有一个前提：**登记了 hash 的块，两个池中的内容都必须有效**。所以：
 
-当前项目已经有一套统一的进度表示（见 [basic/Sequence.md](../basic/Sequence.md#三其他场景下字段的变化)）：
+- **prefill 时两个模型都要跑**（包括 chunked prefill 的每一个 chunk）。`run()` 的 prefill 分支在大模型前向之后，用同一个 context 再调用一次 `self.draft_model(input_ids, positions)`，只写 KV，不计算 logits；
+- **warmup** 走的就是 prefill 路径，草稿模型自然被算进激活峰值；
+- decode 阶段由下一小节的"追赶"保证。
+
+### 5. 草稿模型的进度：Q=2 的第 0 步
+
+一个推测步结束后，两个模型的 KV 进度最多相差 1 个 token：
+
+```
+step 开始时：已确认 t0..t9，t9 = last_token，两个模型的 KV 都覆盖 t0..t8
+草稿模型：输入 t9, d1, ..., d_{K−1}，写入它们的 KV → 生成 d1..dK（dK 从未作为输入）
+大模型：  输入 t9, d1, ..., dK，写入它们的 KV
+```
+
+- 有草稿被拒绝时，两边的有效 KV 都覆盖到最后一个被接受的草稿，**进度一致**；
+- **K 个全部接受时**，大模型有 dK 的 KV，草稿模型没有，**草稿模型落后 1 个 token**。
+
+处理方法：**草稿模型的第 0 次前向总是输入最后 2 个已确认的 token**：
+
+```
+第 0 次：  input = [token(len−2), last_token]，positions = [len−2, len−1]，Q = 2 → 采样 d1
+第 t 次：  input = [d_t]，position = len−1+t，Q = 1 → 采样 d_{t+1}       （t = 1..K−1）
+```
+
+- 落后 1 个时，正好补上位置 len−2 的 KV；
+- 没有落后时，位置 len−2 的 KV 被重新计算一遍，结果相同，覆盖写入无害。
+
+这样不需要额外的字段记录草稿模型的进度，第 0 步的形状永远是规整的 `(B, 2)`，可以录制 CUDA Graph。代价是每步多算 1 个 token，对小模型可以忽略。
+
+草稿模型前向时的 `context_lens`、`slot_mapping` 都按上面的位置计算，block_table 直接用 `seq.block_table`（调度时已经预留到 `len + K`）。草稿 token 只存在于 ModelRunner 的局部张量中，不写入 Sequence。
+
+例外：如果序列恰好在"K 个全部接受"的这一步结束，dK 所在位置的草稿 KV 永远不会补上。若该块已登记 hash，之后命中它的请求会读到这个位置的旧数据。这只会让草稿模型猜得差一点；**验证由大模型完成，输出依然无损**。
+
+### 6. 进度字段：先算、再确认
+
+当前项目已经有一套统一的进度表示（见 [basic/Sequence.md](../basic/Sequence.md)）：
 
 - `num_cached_tokens`：KV 已经写入 cache 的 token 数；
 - `num_scheduled_tokens`：本步要计算的 token 数；
-- ModelRunner 按 `[num_cached_tokens, num_cached_tokens + num_scheduled_tokens)` 这个区间准备输入。
+- ModelRunner 按 `[num_cached_tokens, num_cached_tokens + num_scheduled_tokens)` 准备输入，`hash_blocks` 按同一个范围登记写满的块。
 
-推测解码可以直接套用这套表示，只需要区分**"本步计算了多少"**和**"本步确认了多少"**：
+推测解码只需要区分**"本步计算了多少"**和**"本步确认了多少"**：
 
 ```
-schedule 时：   num_scheduled_tokens = 1 + len(draft)          ← 计算范围包含 draft
-postprocess 时：实际确认的数量 = 1 + 被接受的 draft 数
-                在调用 hash_blocks 之前，把 num_scheduled_tokens 改成实际确认的数量
-                → hash_blocks 和 num_cached_tokens 的推进逻辑都不用改，只会处理已确认的部分
+schedule 时：   num_scheduled_tokens = 1 + K          ← 计算范围包含全部草稿
+postprocess 时：num_scheduled_tokens = 1 + 接受数      ← 改成确认的数量，再调用 hash_blocks
 ```
 
-这样 `hash_blocks` 自然只会为已确认的内容登记 hash，第三节中提到的 prefix cache 安全问题也就不存在了。
+这样 `hash_blocks` 和 `num_cached_tokens` 的推进逻辑完全不用改，被拒绝的 KV 永远不会登记 hash。
 
-### 2. 各组件的改动
+`Scheduler.postprocess_spec`：
 
-| 组件 | 改动 |
-|---|---|
-| **Config** | 新增 `speculative_config`（method、K、n-gram 的最小/最大长度）；断言 `max_num_seqs × (1+K) ≤ max_num_batched_tokens` |
-| **新增 Proposer** | `nanovllm/spec_decode/ngram_proposer.py`，接口为 `propose(seqs) -> list[list[int]]`。只在 rank 0 上创建，由 Scheduler 或 LLMEngine 调用 |
-| **BlockManager** | 把 `can_append(seq)` / `may_append(seq)` 推广为 `can_append(seq, n)` / `may_append(seq, n)`：确保 block_table 能覆盖到位置 `num_cached_tokens + n - 1`。新增 `trim(seq)`：释放超出 `ceil(num_cached_tokens / block_size)` 的尾部块 |
-| **Scheduler** | decode 分支中：先获取 draft，再按 `n = 1 + len(draft)` 检查空间；空间不够时**先截短 draft**，截到 0 仍然不够，才走原来的抢占逻辑。新增 `postprocess_spec`：逐个追加 token，处理中途的 EOS 或 max_tokens，修正 `num_scheduled_tokens` 后调用 `hash_blocks`，最后 `trim` |
-| **Sequence** | 不需要新字段；draft 不写入 `token_ids`。`__getstate__` 保持现状 |
-| **ModelRunner** | 新增 `prepare_verify`：输入为 `[last_token] + draft`，按 uniform decode 补齐到 K+1；新增验证用的 CUDA Graph 档位；`run` 需要额外接收 drafts 参数 |
-| **Context / LMHead** | Context 中增加一个标志，告诉 LMHead 返回所有位置的 logits（MS2 用的是函数参数 `return_all_logits`，二者都可以） |
-| **Sampler** | 新增 RejectionSampler（只在 rank 0 上运行）；n-gram 不需要 draft 的概率分布 |
-| **LLMEngine** | `step()` 中根据是否开启推测解码选择路径；吞吐统计按实际产出的 token 数计算 |
+```python
+def postprocess_spec(self, seqs: list[Sequence], token_ids: list[list[int]]) -> int:
+    num_new_tokens = 0
+    for seq, ids in zip(seqs, token_ids):
+        *accepted, next_id = ids
+        n = 0
+        for token_id in accepted:                          # ① 逐个追加被接受的草稿
+            seq.append_token(token_id)
+            n += 1
+            if self.is_stop(seq, token_id):
+                break
+        seq.num_scheduled_tokens = 1 + n                   # ② 本步确认的范围：last_token + n 个草稿
+        self.block_manager.hash_blocks(seq)                # ③ 只登记确认范围内写满的块
+        seq.num_cached_tokens += seq.num_scheduled_tokens  # ④
+        seq.num_scheduled_tokens = 0
+        if not self.is_stop(seq, seq.last_token):
+            seq.append_token(next_id)                      # ⑤ 修正 / bonus token，KV 下一步再算
+            n += 1
+        num_new_tokens += n
+        if self.is_stop(seq, seq.last_token):
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+    return num_new_tokens
+```
 
-### 3. 与 Scheduler 中其他机制的配合
+`is_stop` 就是现有 `postprocess` 中的停止条件（EOS 或达到 `max_tokens`），抽成一个小函数供两处共用。返回值用于 LLMEngine 统计吞吐。
+
+顺序很重要：`hash_blocks` 用 `seq.block(i)` 读取 token 计算哈希，所以必须**先把被接受的草稿追加进 `token_ids`**，再调用它。
+
+例子：block_size = 4，K = 3，已确认 t0..t9（num_cached_tokens = 9），草稿为 d1、d2、d3，d1 被接受、d2 被拒绝，修正 token 为 r2：
+
+```
+计算范围：[9, 13)，t9 d1 d2 d3 的 KV 都写入了 cache
+① 追加 d1           → token_ids = t0..t9 d1
+② num_scheduled = 2 → 确认范围 [9, 11)
+③ hash_blocks：start = 9//4 = 2，end = 11//4 = 2 → 本步没有写满的块
+④ num_cached_tokens = 11
+⑤ 追加 r2           → last_token = r2，下一步从位置 11 开始计算
+位置 11、12 中 d2、d3 的 KV 已经无效：下一步会被覆盖，也永远不会被登记 hash
+```
+
+### 7. BlockManager：把 append 推广到 n 个 token
+
+```python
+def can_append(self, seq: Sequence, n: int = 1) -> bool:
+    # 本步写入位置 [num_cached_tokens, num_cached_tokens + n)，block_table 要覆盖到最后一个位置
+    needed = (seq.num_cached_tokens + n + self.block_size - 1) // self.block_size - len(seq.block_table)
+    return len(self.free_block_ids) >= max(0, needed)
+
+def may_append(self, seq: Sequence, n: int = 1):
+    while len(seq.block_table) * self.block_size < seq.num_cached_tokens + n:
+        seq.block_table.append(self._allocate_block())
+```
+
+n = 1 时与现有逻辑等价（decode 时 `num_cached_tokens = len(seq) − 1`）。
+
+被拒绝后多出来的块**不释放**：
+
+- 下一步还要预留 K 个位置，这个块大概率马上又要用；
+- 它最多只有 1 个，序列结束或被抢占时由 `deallocate` 一并释放；
+- 它里面只有无效的 KV，但没有登记 hash，不会被别人命中。
+
+### 8. Scheduler：decode 分支
+
+```python
+def schedule(self):
+    ...  # prefill 分支不变
+
+    # decode
+    spec = self.spec_config
+    n = 1
+    if spec and len(self.running) <= spec.max_batch_size \
+            and all(len(seq) + spec.num_speculative_tokens <= self.max_model_len for seq in self.running):
+        n = 1 + spec.num_speculative_tokens
+    while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        seq = self.running.popleft()
+        while not self.block_manager.can_append(seq, n):
+            ...                                     # 抢占，同现有逻辑
+        else:
+            seq.num_scheduled_tokens = n
+            seq.is_prefill = False
+            self.block_manager.may_append(seq, n)
+            scheduled_seqs.append(seq)
+```
+
+- **本步是否推测是整个 batch 统一决定的**。一个 batch 内要么都推测，要么都不推测，保证 verify 的形状统一；
+- **按 batch 大小关闭**：running 超过 `max_batch_size` 时走普通 decode，原有的 CUDA Graph 直接可用；
+- **接近 `max_model_len` 时关闭**：位置 `len + K` 不能超出 `max_model_len`，否则 rotary 的 cos/sin 表和 CUDA Graph 中按 `max_model_len` 分配的 block_tables 列数都会越界。这种情况很少，整批退回普通 decode 最简单；
+- **token 预算**：已经在 Config 中断言 `max_num_seqs × (1 + K) ≤ max_num_batched_tokens`，这里不用再检查。
+
+### 9. ModelRunner
+
+#### (1) 验证：`prepare_verify`
+
+```
+每条序列：input_ids = [last_token, d1, ..., dK]，positions = [len−1, ..., len−1+K]
+          slot_mapping 覆盖这 K+1 个位置，context_lens = len + K
+set_context(False, slot_mapping=..., context_lens=..., block_tables=..., q_len=K+1)
+```
+
+**补齐**（只有 n-gram 会出现）：草稿少于 K 个的序列仍然输入 K+1 个位置，补齐位置的 token 随便填：
+
+- 补齐位置的 `slot_mapping` 设为 -1，`store_kvcache` 会跳过写入；
+- `context_lens` 仍然是 `len + K`，否则右下角对齐的 causal mask 会错位；
+- 补齐位置会读取 `[len + num_drafts, len + K)` 范围内的 cache。因为调度时已经对**整个 batch** 预留了 `len + K` 个位置，这些位置都在合法的块中，读到的内容无意义，但对应的输出在拒绝采样中被 `valid` 屏蔽。
+
+#### (2) Attention：decode 分支按 `q_len` reshape
+
+[context.py](../../nanovllm/utils/context.py) 中新增 `q_len: int = 1`。[attention.py](../../nanovllm/layers/attention.py) 的 decode 分支改为：
+
+```python
+else:    # decode / verify / 草稿模型
+    o = flash_attn_with_kvcache(q.view(-1, context.q_len, self.num_heads, self.head_dim), k_cache, v_cache,
+                                cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                softmax_scale=self.scale, causal=True)
+    o = o.view(-1, self.num_heads, self.head_dim)
+```
+
+`flash_attn_with_kvcache` 的 causal mask 是右下角对齐的：第 j 个 query 只能看到前 `cache_seqlens − q_len + j + 1` 个 key，正好是它自己和它之前的位置。q_len = 1 时与现有行为相同，所以这一处改动同时覆盖了普通 decode（1）、验证（K+1）、草稿模型第 0 步（2）和后续步（1）四种情况。
+
+最后的 `view` 是必须的：[qwen3.py](../../nanovllm/models/qwen3.py) 中 `o_proj(o.flatten(1, -1))` 要求 o 的形状是 `(tokens, H, D)`。
+
+#### (3) LMHead 不用改
+
+[embed_head.py](../../nanovllm/layers/embed_head.py) 的 `ParallelLMHead` 只在 `is_prefill` 时截取每条序列的最后一个位置；验证走的是 decode 路径，B·(K+1) 行都会输出 logits，正好是拒绝采样需要的。
+
+#### (4) CUDA Graph
+
+| 图 | 模型 | 每条序列的 Q 长度 | 用途 | 何时录制 |
+|---|---|---|---|---|
+| `graphs`（已有） | 大模型 | 1 | 普通 decode | 总是 |
+| `verify_graphs` | 大模型 | K+1 | 验证 | 开启推测解码 |
+| `draft_graphs[2]` | 草稿模型 | 2 | 草稿第 0 步 | method = draft_model |
+| `draft_graphs[1]` | 草稿模型 | 1 | 草稿第 1..K−1 步 | method = draft_model |
+
+现有的 `capture_cudagraph` 可以抽成 `capture(model, q_len)`，按 `graph_bs` 分档、为每组图分配 `max_bs × q_len` 大小的 `graph_vars`。`run_model` 根据 `context.q_len` 和模型选择对应的图。
+
+所有图共用同一个内存池，并且先录 token 数最多的：verify 图（从大到小）→ 普通 decode 图 → 草稿模型的两组图。这样池的大小由最大的 verify 图决定。CUDA Graph 的录制机制、限制条件，以及推测解码为满足这些条件所做的设计，详见 [basic/cuda-graph.md](../basic/cuda-graph.md)。
+
+#### (5) `run_spec`
+
+```python
+@torch.inference_mode()
+def run_spec(self, seqs: list[Sequence]):
+    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    if self.spec.method == "ngram":
+        draft_ids, num_drafts, draft_probs = self.ngram_proposer.propose(seqs)       # rank 0
+    else:
+        draft_ids, num_drafts, draft_probs = self.propose_draft_model(seqs, temperatures)
+    input_ids, positions = self.prepare_verify(seqs, draft_ids, num_drafts)
+    logits = self.run_model(input_ids, positions, False)
+    reset_context()
+    if self.rank != 0:
+        return None
+    return self.rejection_sampler(logits, temperatures, draft_ids, num_drafts, draft_probs)
+```
+
+`propose_draft_model` 循环 K 次：准备输入（第 0 次 Q=2，之后 Q=1）→ `run_draft_model`（走对应的草稿图）→ `sampler.sample_with_probs` 得到 token 和 q。
+
+`run_spec` **不修改 Sequence**，只返回 token 列表，所有状态变更都在 `Scheduler.postprocess_spec` 中完成。
+
+#### (6) Sampler
+
+现有的 `Sampler.forward` 用 Gumbel-max 直接返回 token。草稿模型需要同时拿到 token 和分布 q，新增：
+
+```python
+def sample_with_probs(self, logits, temperatures):
+    probs = torch.softmax(logits.float() / temperatures[:, None], -1)
+    return torch.multinomial(probs, 1).squeeze(1), probs
+```
+
+### 10. 张量并行（TP > 1）
+
+第一版在 Config 中断言 `tensor_parallel_size == 1`。架构上已经为 TP 留好了位置，跑通单卡后按下面的方式扩展：
+
+- `run_spec` 通过 `call` 在所有 rank 上执行，大模型和草稿模型的前向在各 rank 上都正常参与 all-reduce；
+- **草稿 token 只在 rank 0 上产生**（n-gram 在 rank 0 上查找；草稿模型的 logits 只 gather 到 rank 0 采样），每产生一批就用 `dist.broadcast` 发给其他 rank。草稿模型每一步一个 `[B]` 的 int64 张量，n-gram 一次 `[B, K]` 加 `[B]`，开销都很小；
+- `num_drafts` 也一起广播，其他 rank 准备 `slot_mapping` 时要用；
+- `Sequence.__getstate__`：草稿模型第 0 步需要最后 2 个 token。开启 draft_model 时，decode 阶段传 `token_ids[-2:]` 而不是只传 `last_token`。
+
+### 11. 统计指标
+
+推测解码的效果主要取决于接受率，调参时必须能看到它。Scheduler 中累计两个计数：
+
+```
+num_draft_tokens    += Σ num_drafts       （提议的草稿数）
+num_accepted_tokens += Σ 接受数            （不含修正 / bonus token）
+接受率 = num_accepted_tokens / num_draft_tokens
+平均每步产出 = (num_accepted_tokens + 推测步数 × B) / (推测步数 × B)
+```
+
+`LLMEngine.generate` 的进度条中，decode 吞吐要按 `postprocess_spec` 返回的实际 token 数计算，而不是 `len(seqs)`；结束时打印接受率。
+
+---
+
+## 六、设计取舍：考虑过但没有采用的方案
+
+| 方案 | 问题 | 本设计的做法 |
+|---|---|---|
+| **验证复用 prefill 的 varlen 路径** | 实现最简单，不需要改 attention；但 prefill 一律走 eager，验证步失去 CUDA Graph，省下的步数被 kernel 启动开销吃掉一部分；LMHead 还要新增"返回所有位置"的参数 | 走 decode 路径，`q_len = K+1`，单独录图；LMHead 不用改 |
+| **草稿模型独立的一套块管理**（两个 free 队列、两张 block_table） | 两个池的块数相等、分配和释放同步进行，维护的是同一份信息；草稿池也拿不到 prefix cache | 共用 block_table，两个池按相同的块号寻址 |
+| **记录草稿模型的 KV 进度，落后时先做一次草稿 prefill** | 需要额外的字段；只要 batch 中有一条序列落后，第 0 步就整体走 eager 的 varlen 路径 | 第 0 步固定 Q=2，形状规整 |
+| **草稿 token 写入 `token_ids`，验证后回滚** | Sequence 中出现未确认的内容；需要 `pop` 操作；回滚分散在 ModelRunner 和 Scheduler 两处 | 草稿只存在于 ModelRunner 的局部张量中；`token_ids` 只包含已确认的内容 |
+| **ModelRunner 直接修改 Sequence** | 状态被两处修改；worker 进程拿到的 Sequence 是每步重新反序列化的副本，修改它没有意义 | ModelRunner 只返回结果，Scheduler 统一修改 |
+| **n-gram 在 LLMEngine / Scheduler 中调用，草稿作为参数传给 ModelRunner** | 两种方法的调用位置不同，step() 中需要分支 | 两种 propose 都在 `run_spec` 内部，step() 只区分"普通 decode / 推测步" |
+| **按需截短草稿：空间不够时减少 K** | 一个 batch 内各序列的草稿数不同，verify 补齐时要读取未分配的块，需要额外处理 block_table 的填充值 | 整个 batch 统一预留 `len + K`，不够就抢占 |
+| **验证后释放多余的块** | 下一步大概率马上又要分配；多一组释放逻辑 | 保留，由 `deallocate` 一并释放 |
+| **Config 中平铺多个字段**（`speculative_model`、`num_speculative_tokens` 等） | 字段多了之后，哪个方法用哪些字段不清楚 | 集中在 `SpeculativeConfig` 中，按方法分别校验 |
+| **每一步都传输完整的 `token_ids`** | 违背当前项目"decode 时只传 `last_token`"的设计，长序列更容易超出 1MB 的共享内存 | 只多传 1 个 token；草稿通过 `dist.broadcast` 传输 |
+
+---
+
+## 七、落地
+
+### 1. 与现有机制的配合
 
 | 机制 | 需要注意的地方 |
 |---|---|
-| **prefill 优先** | 推测解码只发生在 decode step，prefill 完全不变 |
-| **chunked prefill** | 不受影响。最后一个 chunk 完成后，序列进入 running，下一步开始才可能推测 |
-| **抢占** | 被抢占的序列 draft 自然作废。由于 draft 从未写入 `token_ids`，重新 prefill 时不会带入未确认的内容 |
-| **prefix cache** | 依靠"先修正 `num_scheduled_tokens`，再调用 `hash_blocks`"来保证安全，见上文第 1 小节 |
-| **max_tokens** | 一步最多可以产出 K+1 个 token，追加时要逐个检查，超过上限就截断 |
-| **max_model_len** | draft 的位置不能超出 `max_model_len`。CUDA Graph 中 `block_tables` 的列数也是按它分配的，见 [basic/block.md](../basic/block.md#4-仍然可能出问题的边界情况) |
+| **prefill 优先** | 推测解码只发生在 decode step；prefill 时草稿模型与大模型使用同样的输入一起计算 |
+| **chunked prefill** | 每个 chunk 两个模型都要算。最后一个 chunk 完成后序列进入 running，下一步开始才可能推测 |
+| **抢占** | 草稿从未写入 `token_ids`，重新 prefill 时不会带入未确认的内容；因为共用 block_table，两个池的块一起释放 |
+| **prefix cache** | 依靠"先修正 `num_scheduled_tokens`，再调用 `hash_blocks`"保证被拒绝的 KV 永远不会登记 hash；命中的块在两个池中都有效 |
+| **max_tokens / EOS** | 一步最多产出 K+1 个 token，追加时逐个检查，满足停止条件立即停止 |
+| **max_model_len** | 任何序列 `len + K` 超出时，整批退回普通 decode |
+| **CUDA Graph** | 关闭推测解码、或本步不推测时，走原有的 decode 图；`enforce_eager=True` 时所有新增的图都不录制 |
 
-### 4. 向更强的 draft 方法扩展
+### 2. 文件改动清单
 
-如果之后要支持 draft model 或 EAGLE，架构上需要额外考虑：
+| 文件 | 改动 |
+|---|---|
+| **config.py** | 新增 `SpeculativeConfig`；`Config` 新增 `speculative_config` 字段，dict 转换与校验 |
+| **新增 spec_decode/ngram_proposer.py** | `NgramProposer`：从长到短查找最近的一次匹配，输出 `draft_ids` / `num_drafts` |
+| **新增 spec_decode/rejection_sampler.py** | `RejectionSampler`：统一处理 q 为 one-hot / 完整分布、草稿不足 K 个的情况 |
+| **engine/block_manager.py** | `can_append(seq, n)` / `may_append(seq, n)`，n=1 时行为不变 |
+| **engine/scheduler.py** | decode 分支决定 n；新增 `postprocess_spec`；抽出 `is_stop`；累计接受率 |
+| **engine/sequence.py** | 不需要新字段；开启 draft_model 时 `__getstate__` 在 decode 阶段传最后 2 个 token（TP 扩展时） |
+| **engine/model_runner.py** | 按配置创建 `NgramProposer` 或加载草稿模型；`allocate_kv_cache` 计入草稿模型并绑定 `draft_kv_cache`；prefill 时草稿模型一起前向；新增 `prepare_verify`、`propose_draft_model`、`run_spec`；`capture_cudagraph` 抽成按 `(model, q_len)` 录制 |
+| **engine/llm_engine.py** | `step()` 按 `num_scheduled_tokens` 选择 `run` / `run_spec`；吞吐按实际 token 数统计；打印接受率 |
+| **utils/context.py** | 新增 `q_len: int = 1` |
+| **layers/attention.py** | decode 分支按 `q_len` reshape q 和 o |
+| **layers/sampler.py** | 新增 `sample_with_probs` |
+| **layers/embed_head.py** | 不用改 |
+| **example.py / bench.py** | 新增推测解码相关的命令行参数 |
 
-- **Proposer 接口**要能返回 draft 的概率分布：`propose(seqs) -> (drafts, draft_probs | None)`。MS2 的 RejectionSampler 已经支持传入 `draft_probs`，可以直接复用；
-- **draft model 自己的 KV cache**：最简单的做法是给它单独分配一份 KV 池，并且和主模型共用同一张 block_table（两个模型的 KV 写在各自 cache 中的相同位置），这样 BlockManager 不需要改动。代价是 KV 池要按两个模型的 KV 总和来规划容量；
-- **draft model 自身也需要 decode**：K 次小模型前向同样需要 CUDA Graph，否则 kernel 启动开销会抵消大部分收益。
+### 3. 推荐的实现顺序与验证方法
 
-### 5. 推荐的实现顺序
-
-1. Config + n-gram Proposer + Scheduler 的分支逻辑，先用"不做验证、总是拒绝"的模式跑通，确认输出和普通 decode **完全一致**；
-2. 加入验证（先复用 prefill 路径，即 MS2 的做法）和 RejectionSampler，用 temperature 很低的设置对比普通 decode 的输出，检查接受率；
-3. 推广 BlockManager 的 append/trim，用小 block_size 和小 KV 池专门测试回滚和抢占的边界情况；
-4. 实现 uniform decode 的 CUDA Graph，对比开启前后的吞吐；
-5. （可选）动态 K、异步生成 draft、draft model。
+1. **配置与骨架**：`SpeculativeConfig`、`can_append(seq, n)` / `may_append(seq, n)`、Scheduler 的分支、`postprocess_spec`，`q_len` 改动。先让 propose 永远返回 `num_drafts = 0`：每步只产出 1 个 token，输出分布应该与关闭推测解码时完全一致。这一步验证了预留、补齐、后处理和 `hash_blocks` 的正确性；
+2. **n-gram + 拒绝采样**：接入 `NgramProposer` 和 `RejectionSampler`，先用 `enforce_eager=True`。用重复性强的 prompt（例如"把下面这段代码原样输出"）检查接受率应该明显大于 0；
+3. **草稿模型**：加载、显存规划、prefill 时一起计算、Q=2 的第 0 步。一个很好的检查方法是**让草稿模型等于大模型**：这时 p = q，接受率应该接近 100%，每步产出接近 K+1 个 token；
+4. **边界测试**：用小 block_size 和小 KV 池，专门测试抢占、prefix cache 命中、`max_tokens` 和 EOS 出现在草稿中间、序列长度接近 `max_model_len` 的情况；
+5. **CUDA Graph**：录制 verify 图和两组草稿图，对比开启前后的吞吐；
+6. **确定默认值**：在 B = 1、8、16、32、64 上分别测试两种方法，确定 `max_batch_size` 和 K 的默认值；
+7. **（可选）** TP > 1、按接受率动态调整 K、异步生成草稿（GPU 执行第 t 步时 CPU 准备第 t+1 步的 n-gram 草稿）、EAGLE / MTP 风格的草稿头（作为第三种 `method` 接入同一框架）。

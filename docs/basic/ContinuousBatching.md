@@ -204,7 +204,7 @@ def step(self):
 
 ### 7. 适配不断变化的 batch size：CUDA Graph 分桶
 
-decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形状固定。`capture_cudagraph`（[model_runner.py](../../nanovllm/engine/model_runner.py#L234)）预先为 `bs = 1, 2, 4, 8, 16, 32, …, 512` 各录制一张图。运行时（[`run_model`](../../nanovllm/engine/model_runner.py#L197-L212)）选**不小于当前 bs 的最小一档**，多出的位置用 `slot_mapping = -1` 填充，kernel 遇到 -1 会直接跳过写入。prefill 每步长度变化太大，所以走 eager 模式。
+decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形状固定。`capture_cudagraph`（[model_runner.py](../../nanovllm/engine/model_runner.py#L234)）预先为 `bs = 1, 2, 4, 8, 16, 32, …, 512` 各录制一张图。运行时（[`run_model`](../../nanovllm/engine/model_runner.py#L197-L212)）选**不小于当前 bs 的最小一档**，多出的位置用 `slot_mapping = -1` 填充，kernel 遇到 -1 会直接跳过写入。prefill 每步长度变化太大，所以走 eager 模式。录制与重放的完整过程见 [cuda-graph.md](cuda-graph.md)。
 
 ---
 
