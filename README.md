@@ -54,17 +54,16 @@ outputs[0]["text"]
 See `bench.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
+- Hardware: 1× NVIDIA A100-SXM4 (80GB)
+- Model: Qwen3-8B
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
 
 **Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| nano-vLLM-plus      | 133,966     | 93.41    | 1434.13               |
+| Output Tokens | Time (s) | Throughput (tokens/s) |
+|---------------|----------|-----------------------|
+| 133,966       | 44.54    | 3007.95               |
 
 
 ## Star History
