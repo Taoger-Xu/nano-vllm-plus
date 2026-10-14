@@ -1,9 +1,9 @@
-# nano-vllm 项目总览
+# nano-vllm-plus 项目总览
 
 本文分两部分：
 
-- **第一部分：推理引擎的设计问题**。从"处理一个 prompt"出发，逐步扩展到"同时处理很多 prompt"，列出一个 LLM 推理引擎每一步要解决的问题，以及 nano-vllm 的对应方案。
-- **第二部分：nano-vllm 的架构**。说明它如何分层、每层负责什么、层与层之间如何协作，并跟踪一个请求在系统中的完整生命周期。
+- **第一部分：推理引擎的设计问题**。从"处理一个 prompt"出发，逐步扩展到"同时处理很多 prompt"，列出一个 LLM 推理引擎每一步要解决的问题，以及 nano-vllm-plus 的对应方案。
+- **第二部分：nano-vllm-plus 的架构**。说明它如何分层、每层负责什么、层与层之间如何协作，并跟踪一个请求在系统中的完整生命周期。
 
 Continuous batching 的细节见 [ContinuousBatching.md](ContinuousBatching.md)，PagedAttention 与 BlockManager 的细节见 [PagedAttention.md](PagedAttention.md)，本文只概述。
 
@@ -40,24 +40,24 @@ Attention 里，历史 token 的 K、V 不会随着新 token 的到来而改变�
 
 **引擎要考虑的问题**：KV cache 放在哪里、占多少显存、怎么组织布局。
 
-**nano-vllm 的做法**：启动时预分配一整块 KV cache 张量（[model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)）。每层 `Attention` 在前向时先把新的 K/V 写进 cache（Triton kernel `store_kvcache`），再进行 attention 计算（[attention.py](../../nanovllm/layers/attention.py#L59-L75)）。
+**nano-vllm-plus 的做法**：启动时预分配一整块 KV cache 张量（[model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)）。每层 `Attention` 在前向时先把新的 K/V 写进 cache（Triton kernel `store_kvcache`），再进行 attention 计算（[attention.py](../../nanovllm/layers/attention.py#L59-L75)）。
 
 ### 2.2 只算需要的 logits
 
 Prefill 阶段只需要最后一个位置的 logits 来采样下一个 token。对全部 N 个位置都做 `hidden → vocab` 的投影，是很大的浪费（词表通常有 15 万左右）。
 
-**nano-vllm 的做法**：prefill 时，`ParallelLMHead` 根据 `cu_seqlens_q` 只取每条序列最后一个 token 的 hidden state 来计算 logits（[embed_head.py](../../nanovllm/layers/embed_head.py#L57-L66)）。
+**nano-vllm-plus 的做法**：prefill 时，`ParallelLMHead` 根据 `cu_seqlens_q` 只取每条序列最后一个 token 的 hidden state 来计算 logits（[embed_head.py](../../nanovllm/layers/embed_head.py#L57-L66)）。
 
 ### 2.3 采样与停止条件
 
-- **采样**：nano-vllm 只支持 temperature 采样，不支持 greedy（`temperature` 必须大于 0，见 [sampling_params.py](../../nanovllm/sampling_params.py)）。[Sampler](../../nanovllm/layers/sampler.py) 采用指数分布技巧（Gumbel-max 的等价形式）：`argmax(p_i / E_i)`，其中 `E_i ~ Exp(1)`。它与按 `p` 采样在数学上等价，但避免了 `torch.multinomial`，整个函数可以被 `torch.compile` 编译。
+- **采样**：nano-vllm-plus 只支持 temperature 采样，不支持 greedy（`temperature` 必须大于 0，见 [sampling_params.py](../../nanovllm/sampling_params.py)）。[Sampler](../../nanovllm/layers/sampler.py) 采用指数分布技巧（Gumbel-max 的等价形式）：`argmax(p_i / E_i)`，其中 `E_i ~ Exp(1)`。它与按 `p` 采样在数学上等价，但避免了 `torch.multinomial`，整个函数可以被 `torch.compile` 编译。
 - **停止**：遇到 EOS（除非设置了 `ignore_eos`），或生成长度达到 `max_tokens`（[scheduler.py `postprocess`](../../nanovllm/engine/scheduler.py#L81-L92)）。
 
 ### 2.4 Decode 阶段的性能问题
 
 Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小。这时**CPU 发射 kernel 的开销**和**访存次数**成了主要瓶颈。
 
-| 问题 | 手段 | nano-vllm 中的位置 |
+| 问题 | 手段 | nano-vllm-plus 中的位置 |
 |---|---|---|
 | 一次前向要发射几百个 kernel，CPU 开销大 | **CUDA Graph**：预先录制整次前向，运行时一次性 replay | [model_runner.py `capture_cudagraph`](../../nanovllm/engine/model_runner.py#L223) |
 | 小算子很多，访存次数多 | **算子融合**：用 `torch.compile` 融合 RMSNorm（含残差相加）、SiLU×Mul、RoPE、Sampler | [layernorm.py](../../nanovllm/layers/layernorm.py)、[activation.py](../../nanovllm/layers/activation.py)、[rotary_embedding.py](../../nanovllm/layers/rotary_embedding.py) |
@@ -66,7 +66,7 @@ Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小�
 
 ### 2.5 模型太大，一张卡放不下或算得太慢：张量并行
 
-**nano-vllm 的做法**：采用 Megatron 风格的张量并行（TP），在单机内最多支持 8 卡。
+**nano-vllm-plus 的做法**：采用 Megatron 风格的张量并行（TP），在单机内最多支持 8 卡。
 
 - `ColumnParallelLinear`（包括 QKV 和 gate_up）按输出维度切分，每张卡负责一部分 attention 头或一部分中间维度；
 - `RowParallelLinear`（包括 o_proj 和 down_proj）按输入维度切分，算完后做一次 `all_reduce`；
@@ -95,7 +95,7 @@ Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小�
  └─ KV cache 能用多少显存？ ─► 先跑一次最大规模的 warmup 测出峰值，剩余显存全部分给 KV cache
 ```
 
-逐项对应到 nano-vllm：
+逐项对应到 nano-vllm-plus：
 
 | 问题 | 方案 | 代码位置 |
 |---|---|---|
@@ -120,11 +120,11 @@ Decode 每步只处理 1 个 token，GPU 上每个 kernel 的计算量都很小�
 4. **显存**：KV 容量规划，按需分配，抢占，prefix cache 复用。
 5. **扩展性**：张量并行，多进程间的通信，权重的切分与加载。
 
-nano-vllm 在约 1200 行代码里覆盖了这五个维度的核心做法。它**没有**覆盖的部分见文末的局限性一节。
+nano-vllm-plus 在约 1200 行代码里覆盖了这五个维度的核心做法。它**没有**覆盖的部分见文末的局限性一节。
 
 ---
 
-# 第二部分：nano-vllm 的架构
+# 第二部分：nano-vllm-plus 的架构
 
 ## 1. 分层总览
 
@@ -237,7 +237,7 @@ Qwen3ForCausalLM
 
 结构和层的写法相近，但接口和权重布局不同：
 
-| | HuggingFace | nano-vllm |
+| | HuggingFace | nano-vllm-plus |
 |---|---|---|
 | 输入形状 | `[batch, seq_len]`，需要 padding | 一维 `[总 token 数]`，多条序列首尾相接 |
 | 额外输入 | `attention_mask`、`past_key_values` | 无，元数据从 Context 读取，KV cache 挂在 `Attention` 模块上 |
@@ -279,7 +279,7 @@ Qwen3ForCausalLM.forward(input_ids, positions, attn_metadata, kv_caches)
                  └─ Attention.forward(q, k, v, attn_metadata, kv_cache)   ← 只有这里真正用到
 ```
 
-nano-vllm 用全局 Context 绕过中间层：
+nano-vllm-plus 用全局 Context 绕过中间层：
 
 ```python
 # 执行层：prepare_prefill / prepare_decode

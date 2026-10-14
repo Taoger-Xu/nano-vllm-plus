@@ -1,6 +1,6 @@
 # CUDA Graph：decode 阶段的录制与重放
 
-本文说明 nano-vllm 如何用 CUDA Graph 加速 decode：
+本文说明 nano-vllm-plus 如何用 CUDA Graph 加速 decode：
 
 1. CUDA Graph 是什么，解决什么问题；
 2. 一次 decode 前向涉及哪些 kernel，每个 kernel 录死了哪些参数、读写哪些显存地址；
@@ -154,7 +154,7 @@ graph_vars（按最大档位 max_bs = min(max_num_seqs, 512) 分配）
   outputs       [512, hidden]  bf16     @ 0x7f00_9000    每个 token 一行
 ```
 
-**为什么大部分缓冲区是一维的？** nano-vllm 不用 HuggingFace 那种 `[batch, seq_len]` 加补齐的布局，而是把**所有序列的 token 首尾相接拼成一维**。模型中绝大部分计算（embedding、norm、GEMM、rotary、MLP）都是对每个 token 独立进行的，不关心它属于哪条序列；只有 attention 需要序列边界，而边界通过 `context_lens` / `block_tables`（decode）或 `cu_seqlens`（prefill）单独传入。decode 时每条序列恰好 1 个 token，所以 **token 数 = 序列数 = bs**，前四个缓冲区看起来形状一样，但含义不同：前三个按 token 计，`context_lens` 按序列计。`block_tables` 本来就是二维的。
+**为什么大部分缓冲区是一维的？** nano-vllm-plus 不用 HuggingFace 那种 `[batch, seq_len]` 加补齐的布局，而是把**所有序列的 token 首尾相接拼成一维**。模型中绝大部分计算（embedding、norm、GEMM、rotary、MLP）都是对每个 token 独立进行的，不关心它属于哪条序列；只有 attention 需要序列边界，而边界通过 `context_lens` / `block_tables`（decode）或 `cu_seqlens`（prefill）单独传入。decode 时每条序列恰好 1 个 token，所以 **token 数 = 序列数 = bs**，前四个缓冲区看起来形状一样，但含义不同：前三个按 token 计，`context_lens` 按序列计。`block_tables` 本来就是二维的。
 
 进入模型后，形状变化如下：
 
@@ -321,7 +321,7 @@ block_tables[:3, :3] = [[5, 9, -1],
 
 所以本质区别在于：decode 的所有变化都能装进"固定形状、固定地址"的缓冲区，作为数据传给 kernel；prefill 的变化体现在**形状和 Python 标量参数**上，而这两样恰好是图中录死的部分。另外，prefill 本来就是计算瓶颈，发射开销可以忽略，录图的收益也很小。
 
-### 3. 对照 nano-vllm：哪些录了，哪些没录
+### 3. 对照 nano-vllm-plus：哪些录了，哪些没录
 
 | 阶段 | 是否录图 | 原因 |
 |---|---|---|
@@ -393,7 +393,7 @@ verify 图（从大到小）→ 普通 decode 图（从大到小）→ 草稿模
 全 0 的假数据。预热时会把垃圾 KV 写进 KV cache 的第 0 个 slot，但这时没有任何请求，将来这个 slot 被分配时会被覆盖。
 
 **Q：`input_ids`、`positions`、`slot_mapping` 为什么是一维的？**
-nano-vllm 把所有序列的 token 拼成一维，而不是 `[batch, seq_len]` 加补齐。大部分算子按 token 独立计算，只有 attention 需要序列边界，边界通过 `context_lens`、`block_tables` 或 `cu_seqlens` 单独传入。decode 时每条序列 1 个 token，所以这些缓冲区的长度就是 bs。`block_tables` 是每条序列一行，本来就是二维的。
+nano-vllm-plus 把所有序列的 token 拼成一维，而不是 `[batch, seq_len]` 加补齐。大部分算子按 token 独立计算，只有 attention 需要序列边界，边界通过 `context_lens`、`block_tables` 或 `cu_seqlens` 单独传入。decode 时每条序列 1 个 token，所以这些缓冲区的长度就是 bs。`block_tables` 是每条序列一行，本来就是二维的。
 
 **Q：每一步的数据都不一样，为什么能用同一个图？**
 因为变化的只是缓冲区中的数据。KV 写到哪里（`slot_mapping`）、读多长的上下文（`context_lens`）、用哪些物理块（`block_tables`），都是 kernel 在运行时从这些缓冲区中**读出来**的，而不是录死在图里的参数。

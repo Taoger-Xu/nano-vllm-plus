@@ -245,9 +245,9 @@ step 4 起：进入 decode
 
 Chunked prefill 让这种 prompt 也能在预算内被处理：每步只算预算允许的那一段。
 
-**在 vLLM 里还有另一个作用，但 nano-vllm 没有。** 在 vLLM / Sarathi-Serve 中，chunked prefill 还用来**和 decode 混在同一个 step 里执行**：每步先安排所有 decode token，再用剩余的预算处理一段 prefill。这样长 prompt 进来时，正在 decode 的请求不会被卡住。
+**在 vLLM 里还有另一个作用，但 nano-vllm-plus 没有。** 在 vLLM / Sarathi-Serve 中，chunked prefill 还用来**和 decode 混在同一个 step 里执行**：每步先安排所有 decode token，再用剩余的预算处理一段 prefill。这样长 prompt 进来时，正在 decode 的请求不会被卡住。
 
-nano-vllm **不把 prefill 和 decode 混在一起**，而且 prefill 优先。一个被切块的序列会一直留在 `waiting` 队头，所以它的所有 chunk 会**连续几步算完**，这期间 decode 是暂停的。因此在 nano-vllm 中，chunked prefill 的作用**只是"让超长 prompt 能放进每步的预算"**，没有改善延迟的效果。
+nano-vllm-plus **不把 prefill 和 decode 混在一起**，而且 prefill 优先。一个被切块的序列会一直留在 `waiting` 队头，所以它的所有 chunk 会**连续几步算完**，这期间 decode 是暂停的。因此在 nano-vllm-plus 中，chunked prefill 的作用**只是"让超长 prompt 能放进每步的预算"**，没有改善延迟的效果。
 
 ### 3. 实现：调度、执行、后处理三处配合
 
@@ -299,7 +299,7 @@ causal mask：右下对齐 → Q 中的第 j 个 token（实际位置为 1000+j�
 
 FlashAttention 在 `seqlen_q < seqlen_k` 时，causal mask 按**右下角对齐**，正好符合"Q 是 K 的最后一段"这种情况。
 
-这套机制和 **prefix cache 命中**完全相同：两者都是"前缀已经在 cache 中，本步只计算后面的部分"。所以 nano-vllm 用同一段代码同时支持了这两种功能。
+这套机制和 **prefix cache 命中**完全相同：两者都是"前缀已经在 cache 中，本步只计算后面的部分"。所以 nano-vllm-plus 用同一段代码同时支持了这两种功能。
 
 #### (3) 后处理：中间的 chunk 不产出 token
 
@@ -318,7 +318,7 @@ seq.append_token(token_id)
 
 ### 4. 小结
 
-| 问题 | nano-vllm 的做法 |
+| 问题 | nano-vllm-plus 的做法 |
 |---|---|
 | 什么时候切块 | 一条序列独占一整步的预算仍然放不下时（只有 batch 中第一条序列可以被切块） |
 | 进度记在哪里 | `seq.num_cached_tokens` |
@@ -381,7 +381,7 @@ KV cache 确实会随着 chunk 一段段增长，但它**不会去申请新的�
 
 ### 4. 仍然可能出问题的边界情况
 
-上面说的是正常路径。nano-vllm 为了保持代码精简，没有对输入长度做校验，下面几种情况会出错。它们都不是显存 OOM，而是报错：
+上面说的是正常路径。nano-vllm-plus 为了保持代码精简，没有对输入长度做校验，下面几种情况会出错。它们都不是显存 OOM，而是报错：
 
 | 情况 | 结果 |
 |---|---|
@@ -389,7 +389,7 @@ KV cache 确实会随着 chunk 一段段增长，但它**不会去申请新的�
 | **prompt 长度加上生成长度超过 `max_model_len`** | 代码不检查这一点。decode 走 CUDA Graph 时，`graph_vars["block_tables"]` 只有 `max_model_len / block_size` 列，序列的块数超过这个值，拷贝时会形状不匹配并报错（[model_runner.py:210](../../nanovllm/engine/model_runner.py#L210)） |
 | **warmup 之后显存环境发生变化** | 比如同一张卡上又启动了别的进程，或者显存碎片导致实际可用显存比测量时少。这种情况下仍可能 OOM，`gpu_memory_utilization` 默认设为 0.9 就是为了留出余量 |
 
-vLLM 会在 `add_request` 时就拒绝超过 `max_model_len` 的请求，nano-vllm 省略了这一步。
+vLLM 会在 `add_request` 时就拒绝超过 `max_model_len` 的请求，nano-vllm-plus 省略了这一步。
 
 ### 5. 总结
 

@@ -1,6 +1,6 @@
-# PagedAttention 原理与 nano-vllm 的实现
+# PagedAttention 原理与 nano-vllm-plus 的实现
 
-本文先讲 PagedAttention 要解决的问题和核心思想，再按层拆解 nano-vllm 的实现。重点是逻辑层的 `Block` 与 `BlockManager`：逐个方法分析它们做了什么、为什么这么写，并用一个完整的状态追踪例子串起来。
+本文先讲 PagedAttention 要解决的问题和核心思想，再按层拆解 nano-vllm-plus 的实现。重点是逻辑层的 `Block` 与 `BlockManager`：逐个方法分析它们做了什么、为什么这么写，并用一个完整的状态追踪例子串起来。
 
 相关文档：[overview.md](overview.md)、[ModelRunner.md](ModelRunner.md)、[ContinuousBatching.md](ContinuousBatching.md)。
 
@@ -63,11 +63,11 @@ vLLM 论文统计，当时的系统里 KV cache 只有 **20%–38%** 真正存�
 
 ### 4. 代价：attention kernel 要能"跳着读"
 
-普通 attention 假设一条序列的 K/V 在显存中是连续的。分页之后，K/V 散落在不同的物理块里，kernel 必须先查 block table 才能读到数据。vLLM 最初为此专门写了 paged attention kernel；现在 FlashAttention 也通过 `block_table` 参数原生支持分页 KV。nano-vllm 直接使用后者。
+普通 attention 假设一条序列的 K/V 在显存中是连续的。分页之后，K/V 散落在不同的物理块里，kernel 必须先查 block table 才能读到数据。vLLM 最初为此专门写了 paged attention kernel；现在 FlashAttention 也通过 `block_table` 参数原生支持分页 KV。nano-vllm-plus 直接使用后者。
 
 ---
 
-## 二、nano-vllm 的三层实现
+## 二、nano-vllm-plus 的三层实现
 
 ```
 ┌─ 逻辑层（CPU，scheduler 所在进程）─────────────────────────────┐
@@ -553,7 +553,7 @@ kernel 内部会按 `block_table[seq][pos // block_size]` 找到物理块，在�
 
 ## 八、与 vLLM 原版的差异
 
-| 方面 | vLLM | nano-vllm |
+| 方面 | vLLM | nano-vllm-plus |
 |---|---|---|
 | 块大小 | 默认 16 | 256（FlashAttention 分页接口的要求） |
 | attention kernel | 自研 paged attention kernel，或 FlashAttention / FlashInfer 等后端 | 直接用 `flash_attn` 的 `block_table` 参数 |

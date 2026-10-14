@@ -1,6 +1,6 @@
 # Scheduler 设计
 
-[scheduler.py](../../nanovllm/engine/scheduler.py) 只有 92 行，但做了一连串设计取舍。本文先说它在系统中的位置，再按"设计一个调度器必须回答的问题"逐条拆解：每个问题有哪些做法、nano-vllm 选了哪种、为什么这样选、代价是什么。
+[scheduler.py](../../nanovllm/engine/scheduler.py) 只有 92 行，但做了一连串设计取舍。本文先说它在系统中的位置，再按"设计一个调度器必须回答的问题"逐条拆解：每个问题有哪些做法、nano-vllm-plus 选了哪种、为什么这样选、代价是什么。
 
 块分配、chunked prefill 的实现细节见 [block.md](block.md) 和 [PagedAttention.md](PagedAttention.md)，这里只从调度策略的角度提及。整体架构见 [overview.md](overview.md)。
 
@@ -35,11 +35,11 @@ LLMEngine.step()
 | 请求级（static batching） | 一批请求一起开始、一起结束 |
 | **迭代级（iteration-level）** | 每次前向之前都重新决定 batch 的成员 |
 
-**nano-vllm 的选择**：迭代级。`LLMEngine.step()` 每调用一次，就执行一次 `schedule()`。这是 continuous batching 的基础，原因见 [ContinuousBatching.md](ContinuousBatching.md)。
+**nano-vllm-plus 的选择**：迭代级。`LLMEngine.step()` 每调用一次，就执行一次 `schedule()`。这是 continuous batching 的基础，原因见 [ContinuousBatching.md](ContinuousBatching.md)。
 
 ### 问题 2：序列的状态怎么建模？
 
-**nano-vllm 的选择**：三种状态，其中两种用队列表示。
+**nano-vllm-plus 的选择**：三种状态，其中两种用队列表示。
 
 ```
           add()                  prefill 全部算完                 EOS / max_tokens
@@ -58,11 +58,11 @@ LLMEngine.step()
 
 | 方案 | 优点 | 缺点 |
 |---|---|---|
-| **分开执行，prefill 优先**（nano-vllm、早期 vLLM） | 每步只有一种计算模式，逻辑简单；decode 步可以完整使用 CUDA Graph | 新请求到来时 decode 要暂停，生成 token 的间隔不均匀 |
+| **分开执行，prefill 优先**（nano-vllm-plus、早期 vLLM） | 每步只有一种计算模式，逻辑简单；decode 步可以完整使用 CUDA Graph | 新请求到来时 decode 要暂停，生成 token 的间隔不均匀 |
 | 分开执行，decode 优先 | decode 延迟平稳 | 新请求的首 token 延迟（TTFT）变差；batch 较小，吞吐下降 |
 | 混合执行（vLLM v1、Sarathi-Serve） | 吞吐和延迟兼顾 | attention 要同时处理两种情况；混合 batch 难以使用 CUDA Graph；调度逻辑复杂 |
 
-**nano-vllm 的选择**：分开执行，prefill 优先（[scheduler.py:29-55](../../nanovllm/engine/scheduler.py#L29-L55)）：
+**nano-vllm-plus 的选择**：分开执行，prefill 优先（[scheduler.py:29-55](../../nanovllm/engine/scheduler.py#L29-L55)）：
 
 ```python
 # prefill
@@ -77,7 +77,7 @@ while self.running and ...:
 
 **这样选的理由**：
 
-1. **符合离线场景的目标**：nano-vllm 的 `generate()` 一次性提交所有请求，关注的是**总吞吐**，而不是单个请求的延迟抖动。prefill 优先能尽快把 `running` 填满，让 decode 的 batch 尽可能大。
+1. **符合离线场景的目标**：nano-vllm-plus 的 `generate()` 一次性提交所有请求，关注的是**总吞吐**，而不是单个请求的延迟抖动。prefill 优先能尽快把 `running` 填满，让 decode 的 batch 尽可能大。
 2. **执行层可以保持简单**：`is_prefill` 只是一个 bool，ModelRunner 根据它选择 `prepare_prefill` 或 `prepare_decode`，Attention 根据它选择 `flash_attn_varlen_func` 或 `flash_attn_with_kvcache`。decode 步的形状规整，可以直接 replay CUDA Graph。
 
 **不会出现死等**：如果 `waiting` 不为空，但队头的序列放不下（块不够），这一步就调度不到任何 prefill，会自动转去执行 decode。等 decode 中有序列结束、释放了块，下一步再试。
@@ -104,7 +104,7 @@ decode 不检查 token 预算：每条序列只算 1 个 token，所以总 token
 | FCFS + 跳过 | 队头放不下时，跳过它，尝试后面较小的请求 |
 | 优先级 / SJF | 按优先级或预估长度排序 |
 
-**nano-vllm 的选择**：严格 FCFS。prefill 循环始终只看 `waiting[0]`，有三种情况会直接 `break`：
+**nano-vllm-plus 的选择**：严格 FCFS。prefill 循环始终只看 `waiting[0]`，有三种情况会直接 `break`：
 
 ```python
 if remaining == 0: break                                  # token 预算用完
@@ -121,7 +121,7 @@ if remaining < num_tokens and scheduled_seqs: break       # 放不下，而且�
 
 ### 问题 6：太长的 prompt 怎么办？
 
-**nano-vllm 的选择**：chunked prefill，并且只允许 batch 中的第一条序列被切块（[scheduler.py:42](../../nanovllm/engine/scheduler.py#L42)）。
+**nano-vllm-plus 的选择**：chunked prefill，并且只允许 batch 中的第一条序列被切块（[scheduler.py:42](../../nanovllm/engine/scheduler.py#L42)）。
 
 - 只有当一条序列**独占整个 token 预算仍然放不下**时才会切块。这样每一步最多只有一条"算了一半"的序列，状态最容易管理。
 - 没算完的序列不出队，下一步仍然排在队头，继续算下一段。这也是严格 FCFS 带来的结果。
@@ -222,7 +222,7 @@ schedule()
 
 ## 四、设计取舍总结
 
-| 设计问题 | nano-vllm 的选择 | 带来的好处 | 付出的代价 |
+| 设计问题 | nano-vllm-plus 的选择 | 带来的好处 | 付出的代价 |
 |---|---|---|---|
 | 调度粒度 | 每步重新调度（迭代级） | continuous batching | 每步都有一些 CPU 开销 |
 | prefill 和 decode | 分开执行，prefill 优先 | 执行层简单，decode 可以使用 CUDA Graph，离线吞吐高 | 新请求到来时 decode 暂停一步，token 间隔有抖动 |
@@ -233,9 +233,9 @@ schedule()
 | running 顺序 | 始终保持进入时间顺序 | 抢占选择受害者的规则一直正确 | 超出 `max_num_seqs` 的序列要排队 |
 | 资源回收 | 序列结束的同一步就释放 | 下一步就能接纳新请求 | 无 |
 
-### nano-vllm 没有考虑的部分
+### nano-vllm-plus 没有考虑的部分
 
-这些在 vLLM 中都有，nano-vllm 为了保持简洁而省略了：
+这些在 vLLM 中都有，nano-vllm-plus 为了保持简洁而省略了：
 
 - 请求优先级、SLO 感知调度、公平性策略（目前只有 FCFS）；
 - prefill 和 decode 混合执行；

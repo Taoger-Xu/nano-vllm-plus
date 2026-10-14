@@ -1,6 +1,6 @@
-# 扩展一：让 nano-vllm 支持 MoE 模型
+# 扩展一：让 nano-vllm-plus 支持 MoE 模型
 
-本文讨论如何在当前 nano-vllm 的架构上支持 MoE（Mixture of Experts）模型，例如 Qwen3-MoE。内容分三部分：
+本文讨论如何在当前 nano-vllm-plus 的架构上支持 MoE（Mixture of Experts）模型，例如 Qwen3-MoE。内容分三部分：
 
 1. MoE 给推理引擎带来了哪些新问题；
 2. 参考项目 [nano-vLLM-MS2](https://github.com/banfeb/nano-vLLM-MS2)（下文简称 **MS2**）是怎么实现的；
@@ -8,7 +8,7 @@
 
 阅读前建议先看 [basic/overview.md](../basic/overview.md) 中的分层架构，本文会反复用到其中的"模型层 / 算子层 / 执行层 / 调度层"等概念。
 
-> 说明：MS2 基于较早版本的 nano-vllm（chunked prefill 重构之前），本文提到它的实现时，只借鉴设计思路；落地方案以当前项目的代码为准。对 MS2 的分析来自阅读源码，没有在 GPU 上实际运行。
+> 说明：MS2 基于较早版本的 nano-vllm-plus（chunked prefill 重构之前），本文提到它的实现时，只借鉴设计思路；落地方案以当前项目的代码为准。对 MS2 的分析来自阅读源码，没有在 GPU 上实际运行。
 
 ---
 
@@ -138,7 +138,7 @@ kernel 中：每个 program 处理一个 block（block_size 个槽位，它们�
 | `FusedMoEPrepareAndFinalize` | prepare：激活值量化，或 EP 时把 token 发往对应的卡（dispatch）；finalize：合并结果，或 EP 时收回 token（combine） | 加入 EP |
 | `FusedMoEPermuteExpertsUnpermute`（`TritonExperts`） | 真正的计算：重排、GEMM、激活、GEMM、合并 | 换成 CUTLASS 等后端 |
 
-这套抽象的价值在于：**量化、并行方式、计算后端三个维度可以独立替换**。对 nano-vllm 这种教学型项目来说有些重，但它为以后加入 EP 和量化留出了位置。
+这套抽象的价值在于：**量化、并行方式、计算后端三个维度可以独立替换**。对 nano-vllm-plus 这种教学型项目来说有些重，但它为以后加入 EP 和量化留出了位置。
 
 ### 4. 权重的组织与加载
 
@@ -263,7 +263,7 @@ MS2 有 `SharedFusedMoE` 类，但目前只是直接调用父类。Qwen3-MoE 没
 | **EP（按 expert 分配到不同卡）** | 每张卡持有 E/ep 个完整的 expert | dispatch 和 combine 两次 all-to-all | expert 数量多、卡数多；单个 expert 的中间维度很小，再做 TP 切分会让 GEMM 太窄 |
 | TP + EP 混合 | attention 用 TP，MoE 用 EP | 两种都有 | 大规模部署 |
 
-对 nano-vllm 来说，**建议先只做 TP**：它和现有的并行模型完全一致，只需要在 MoE 输出后加一次 all_reduce。同时保留 `PrepareAndFinalize` 这个扩展点，将来加入 EP 时，只需新增一个实现 dispatch/combine 的子类，模型层不用改。
+对 nano-vllm-plus 来说，**建议先只做 TP**：它和现有的并行模型完全一致，只需要在 MoE 输出后加一次 all_reduce。同时保留 `PrepareAndFinalize` 这个扩展点，将来加入 EP 时，只需新增一个实现 dispatch/combine 的子类，模型层不用改。
 
 注意一个约束：TP 切分的是每个 expert 的中间维度 `moe_intermediate_size`。它通常很小（Qwen3-MoE 中远小于 dense 模型的 `intermediate_size`），切分之后每张卡上的 GEMM 会非常窄。这正是大规模部署时更倾向于用 EP 的原因。
 

@@ -1,6 +1,6 @@
-# 扩展二：让 nano-vllm 支持推测解码（Speculative Decoding）
+# 扩展二：让 nano-vllm-plus 支持推测解码（Speculative Decoding）
 
-本文是在当前 nano-vllm 上实现推测解码的设计文档。目标是用**一套统一的框架**同时支持两种草稿来源：
+本文是在当前 nano-vllm-plus 上实现推测解码的设计文档。目标是用**一套统一的框架**同时支持两种草稿来源：
 
 - **n-gram（prompt lookup）**：从上下文中查找重复片段作为草稿，零额外显存；
 - **草稿小模型（draft model）**：用同系列的小模型（如 Qwen3-0.6B）为大模型（如 Qwen3-8B）打草稿。
@@ -109,7 +109,7 @@ batch 增大后，有两项开销会变得显著：
 | **配置切换** | 通过一个 `speculative_config` 选择方法和参数；不配置时行为与现在完全相同 |
 | **无损** | 输出分布与不开推测解码时完全一致 |
 | **保持 CUDA Graph** | 验证步和草稿模型的前向都要能录图，否则省下的步数会被 kernel 启动开销吃掉 |
-| **改动最小** | 尽量复用现有的进度字段、`hash_blocks`、decode 的 attention 路径，保持 nano-vllm 简洁的风格 |
+| **改动最小** | 尽量复用现有的进度字段、`hash_blocks`、decode 的 attention 路径，保持 nano-vllm-plus 简洁的风格 |
 | **保持现有分工** | Scheduler 是唯一修改序列状态的地方；ModelRunner 只读输入、返回结果 |
 
 ### 2. 推测解码对引擎各层的要求
@@ -321,7 +321,7 @@ class NgramProposer:
         return tokens[:0]
 ```
 
-这是最直接的 O(L·n) 写法，符合 nano-vllm 的风格。如果长序列的匹配成为瓶颈，可以换成 KMP 或用 Numba 加速，接口不变。
+这是最直接的 O(L·n) 写法，符合 nano-vllm-plus 的风格。如果长序列的匹配成为瓶颈，可以换成 KMP 或用 Numba 加速，接口不变。
 
 ### 3. 统一的拒绝采样：RejectionSampler
 

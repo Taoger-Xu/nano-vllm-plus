@@ -1,9 +1,9 @@
-# nano-vllm 中的 Continuous Batching
+# nano-vllm-plus 中的 Continuous Batching
 
 本文分三部分：
 1. 为什么需要 continuous batching；
 2. 它依赖的三项配套技术，以及各自的必要性；
-3. nano-vllm 的具体实现。
+3. nano-vllm-plus 的具体实现。
 
 文中的代码链接都指向本仓库的源码。
 
@@ -94,7 +94,7 @@ batch 开不大，continuous batching 的收益也就没有了。
 
 **解法**：借鉴操作系统的分页机制。
 
-- 把 KV cache 切成固定大小的 block（nano-vllm 中每块 256 个 token），见 [model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)。
+- 把 KV cache 切成固定大小的 block（nano-vllm-plus 中每块 256 个 token），见 [model_runner.py `allocate_kv_cache`](../../nanovllm/engine/model_runner.py#L103-L121)。
 - 每条序列维护一张 `block_table`（逻辑块号 → 物理块号），物理块**不需要连续**，任何空闲块都能用。
 - **按需分配**：prefill 时只分配 prompt 需要的块；decode 时只在序列写满当前块、跨入新块时才多分配一个（[block_manager.py `may_append`](../../nanovllm/engine/block_manager.py#L106)）。
 - **结束立即归还**：序列结束后 `deallocate`，空出的块下一个 step 就能给新序列用。
@@ -135,7 +135,7 @@ while not self.block_manager.can_append(seq):   # 需要新块但没有空闲块
 
 ---
 
-## 三、nano-vllm 的实现
+## 三、nano-vllm-plus 的实现
 
 整体结构如下：
 
@@ -210,7 +210,7 @@ decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形�
 
 ## 四、小结：与 vLLM 的差异
 
-| 方面 | nano-vllm 的做法 |
+| 方面 | nano-vllm-plus 的做法 |
 |---|---|
 | 调度粒度 | 每个 step 重新调度（iteration-level） |
 | prefill 与 decode | **不混批**，prefill 优先；有待 prefill 的序列时，decode 暂停一步 |
@@ -220,4 +220,4 @@ decode 阶段 batch size 每步都可能不同，而 CUDA Graph 要求输入形�
 | 去 padding | 拼成扁平 batch + FlashAttention varlen / kvcache 接口 |
 | batch size 变化 | CUDA Graph 分桶 |
 
-和 vLLM v1 / Sarathi-Serve 的主要区别是：**nano-vllm 没有在同一个 step 里把 prefill 块和 decode token 混在一起**。所以新请求进来时，正在 decode 的序列会被打断一步（生成 token 的间隔出现抖动）。好处是调度逻辑非常简洁，整个调度器只有约 90 行，适合用来理解 continuous batching 的核心机制。
+和 vLLM v1 / Sarathi-Serve 的主要区别是：**nano-vllm-plus 没有在同一个 step 里把 prefill 块和 decode token 混在一起**。所以新请求进来时，正在 decode 的序列会被打断一步（生成 token 的间隔出现抖动）。好处是调度逻辑非常简洁，整个调度器只有约 90 行，适合用来理解 continuous batching 的核心机制。

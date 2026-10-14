@@ -1,14 +1,16 @@
 <p align="center">
-<img width="300" src="assets/logo.png">
+<img width="300" src="assets/logo-plus.png">
 </p>
 
 <p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="Taoger-Xu%2Fnano-vllm-plus | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
-# Nano-vLLM
+# nano-vLLM-plus
 
-A lightweight vLLM implementation built from scratch.
+A lightweight, readable vLLM implementation built from scratch for understanding and experimenting with modern LLM inference. nano-vLLM-plus keeps the core serving path small while including practical optimizations such as paged attention, continuous batching, prefix caching, tensor parallelism, Torch compilation, and CUDA graphs.
+
+The project is designed for developers who want to study how an inference engine works end to end, adapt the implementation for experiments, and benchmark changes against vLLM.
 
 ## Key Features
 
@@ -19,7 +21,9 @@ A lightweight vLLM implementation built from scratch.
 ## Installation
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+git clone https://github.com/Taoger-Xu/nano-vllm-plus.git
+cd nano-vllm-plus
+uv sync
 ```
 
 ## Model Download
@@ -33,12 +37,12 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+See `example.py` for usage. Run it with `uv run python example.py`. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
+prompts = ["Hello, nano-vLLM-plus."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
@@ -58,9 +62,9 @@ See `bench.py` for benchmark.
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
 | vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+| nano-vLLM-plus      | 133,966     | 93.41    | 1434.13               |
 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Taoger-Xu/nano-vllm-plus&type=Date)](https://www.star-history.com/#Taoger-Xu/nano-vllm-plus&Date)
