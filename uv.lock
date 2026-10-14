@@ -381,21 +381,26 @@ name = "nano-vllm-plus"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "flash-attn" },
     { name = "torch" },
     { name = "transformers" },
     { name = "triton" },
     { name = "xxhash" },
 ]
 
+[package.optional-dependencies]
+cuda = [
+    { name = "flash-attn" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "flash-attn" },
+    { name = "flash-attn", marker = "extra == 'cuda'" },
     { name = "torch", specifier = ">=2.4.0" },
     { name = "transformers", specifier = ">=4.51.0" },
     { name = "triton", specifier = ">=3.0.0" },
     { name = "xxhash" },
 ]
+provides-extras = ["cuda"]
 
 [[package]]
 name = "networkx"

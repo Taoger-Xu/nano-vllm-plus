@@ -24,6 +24,8 @@ The project is designed for developers who want to study how an inference engine
 git clone https://github.com/Taoger-Xu/nano-vllm-plus.git
 cd nano-vllm-plus
 uv sync
+# GPU 推理需要 FlashAttention：
+# uv sync --extra cuda
 ```
 
 ## Model Download
