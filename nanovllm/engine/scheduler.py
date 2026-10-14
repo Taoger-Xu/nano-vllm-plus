@@ -8,8 +8,8 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_seqs = config.max_num_seqs                          # 每步 batch 的序列数上限
+        self.max_num_batched_tokens = config.max_num_batched_tokens      # 每步 batch 的 token 数上限（只在 prefill 中检查）
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -27,11 +27,11 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:      # 限制一：序列数不超过 max_num_seqs
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            remaining = self.max_num_batched_tokens - num_batched_tokens     # 限制二：本步剩余的 token 预算
             if remaining == 0:
-                break
+                break                                                        # token 预算用完，本批装满
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
@@ -40,11 +40,11 @@ class Scheduler:
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
+                break                                                        # 放不下且不是本批第一条 → 留到下一步，不切分
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = min(num_tokens, remaining)            # 第一条放不下时只取 remaining 个 → chunked prefill
+            num_batched_tokens += seq.num_scheduled_tokens                   # 计入本步 token 总数
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
@@ -55,8 +55,8 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:      # decode 只受序列数限制：每条只算 1 个 token，
+            seq = self.running.popleft()                                     #   总数 ≤ max_num_seqs，远小于 max_num_batched_tokens
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())

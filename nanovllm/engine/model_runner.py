@@ -91,9 +91,11 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        # 构造一次最大规模的 prefill（总 token 数 = max_num_batched_tokens），测出激活峰值；
+        # allocate_kv_cache 会把这个峰值预留出来，剩下的显存才分给 KV cache
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+        seq_len = min(max_num_batched_tokens, max_model_len)                 # 单条序列不能超过 max_model_len
+        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)   # 条数同时受两个上限约束
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
@@ -223,7 +225,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 512)                          # decode batch 不会超过 max_num_seqs；超过 512 时走 eager
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
