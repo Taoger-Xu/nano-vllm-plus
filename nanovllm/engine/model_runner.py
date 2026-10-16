@@ -134,11 +134,29 @@ class ModelRunner:
     实际的 KV Cache 是一个大张量，其物理布局
     """
     def get_kv_cache_block_bytes(self, hf_config):
+        """计算一个逻辑 KV cache block 所需的显存字节数。
+
+        Args:
+            hf_config (AutoConfig): 当前模型的 Hugging Face 配置。
+
+        Returns:
+            int: 当前模型每个 KV cache block 的字节数。
+        """
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         return 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
 
     def bind_kv_cache(self, model, kv_cache, hf_config):
+        """将模型中每一层 Attention 绑定到对应的 KV cache 切片。
+
+        Args:
+            model (torch.nn.Module): 要绑定 KV cache 的 Transformer 模型。
+            kv_cache (torch.Tensor): 形状为 ``[2, layers, blocks, ...]`` 的 KV cache。
+            hf_config (AutoConfig): 当前模型的 Hugging Face 配置，用于校验层数。
+
+        Returns:
+            None: 该函数直接修改模型中 Attention 模块的 cache 引用。
+        """
         layer_id = 0
         for module in model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -279,7 +297,17 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run_prefill_models(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """让主模型和草稿模型使用同一批输入执行 prefill。
+
+        Args:
+            input_ids (torch.Tensor): CUDA 上的输入 token，形状为 ``[num_tokens]``。
+            positions (torch.Tensor): CUDA 上的位置索引，形状为 ``[num_tokens]``。
+
+        Returns:
+            torch.Tensor: 主模型的 hidden states，供后续计算 logits；草稿模型只写入 KV cache。
+        """
         # 两个模型复用同一套输入和 Context；Attention 的 cache 已分别绑定。
         target_hidden_states = self.model(input_ids, positions)
         if self.draft_model is not None:

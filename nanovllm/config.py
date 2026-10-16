@@ -14,6 +14,11 @@ class SpeculativeConfig:
     hf_config: AutoConfig | None = None
 
     def __post_init__(self):
+        """校验推测解码配置并加载草稿模型的 Hugging Face 配置。
+
+        Returns:
+            None: 配置通过校验后，草稿模型配置写入 ``hf_config``。
+        """
         assert self.method in ("ngram", "draft_model")
         assert self.num_speculative_tokens > 0
         assert self.max_batch_size > 0
