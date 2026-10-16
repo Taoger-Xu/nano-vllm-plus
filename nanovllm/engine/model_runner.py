@@ -32,7 +32,19 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        # 主模型初始化后增加草稿模型初始化
+        self.speculative_config = config.speculative_config
+        self.draft_model = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "draft_model"
+        ):
+            spec = self.speculative_config
+            self.draft_model = Qwen3ForCausalLM(spec.hf_config)
+            load_model(self.draft_model, spec.model)
         self.sampler = Sampler()
+
+        # warmup 需要测量两个模型同时执行时的激活峰值
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -97,6 +109,7 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    @torch.inference_mode()
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -108,13 +121,32 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        input_ids, positions = self.prepare_prefill(seqs)
+        # warmup 同时执行两个模型，把草稿模型的激活显存计入峰值。
+        self.model(input_ids, positions)
+        if self.draft_model is not None:
+            self.draft_model(input_ids, positions)
+        reset_context()
         torch.cuda.empty_cache()
 
     """
     真实的分配kv cache对应的张量
     实际的 KV Cache 是一个大张量，其物理布局
     """
+    def get_kv_cache_block_bytes(self, hf_config):
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        return 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+
+    def bind_kv_cache(self, model, kv_cache, hf_config):
+        layer_id = 0
+        for module in model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = kv_cache[0, layer_id]
+                module.v_cache = kv_cache[1, layer_id]
+                layer_id += 1
+        assert layer_id == hf_config.num_hidden_layers
+
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -122,11 +154,10 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size   # KV cache 也按头切：每个 rank 只存自己的 kv 头，
-                                                                           #   所有 rank 共用 rank 0 Scheduler 分配的 block_table
-        # 注意：每个 rank 按自己 GPU 的空闲显存算块数，但 Scheduler 只用 rank 0 的结果；各卡空闲显存不同时可能越界，代码中没有检查
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # 两个模型共用逻辑 block_table，但各自拥有独立的物理 KV cache。
+        block_bytes = self.get_kv_cache_block_bytes(hf_config)
+        if self.draft_model is not None:
+            block_bytes += self.get_kv_cache_block_bytes(self.speculative_config.hf_config)
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         """
@@ -140,14 +171,17 @@ class ModelRunner:
             )
             不同的attention 通过索引获取自己的kv cache module.k_cache = kv_cache[0, layer_id]
         """
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        # 绑定每一层的 KV cache 到对应的 attention 模块
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.bind_kv_cache(self.model, self.kv_cache, hf_config)
+
+        if self.draft_model is not None:
+            draft_config = self.speculative_config.hf_config
+            draft_num_kv_heads = draft_config.num_key_value_heads // self.world_size
+            draft_head_dim = getattr(draft_config, "head_dim", draft_config.hidden_size // draft_config.num_attention_heads)
+            self.draft_kv_cache = torch.empty(2, draft_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, draft_num_kv_heads, draft_head_dim)
+            self.bind_kv_cache(self.draft_model, self.draft_kv_cache, draft_config)
     """
     因为要传给 flash-attn 的是一个规整的二维张量，
     而每条序列的块数不同，长短不一的列表拼不成矩阵
@@ -245,10 +279,23 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def run_prefill_models(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        # 两个模型复用同一套输入和 Context；Attention 的 cache 已分别绑定。
+        target_hidden_states = self.model(input_ids, positions)
+        if self.draft_model is not None:
+            # 草稿模型此处只写 KV cache，不计算 logits。
+            self.draft_model(input_ids, positions)
+        return target_hidden_states
+
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        if is_prefill:
+            hidden_states = self.run_prefill_models(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
+        else:
+            logits = self.run_model(input_ids, positions, False)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
