@@ -21,24 +21,25 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
+        # spawn 而不是 fork：fork 出的子进程不能使用 CUDA。子进程拿到的是 config 的一份 pickle 拷贝
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
+        for i in range(1, config.tensor_parallel_size):              # ① 先启动 rank 1..N−1
+            event = ctx.Event()                                      #    每个子进程一个 Event，rank 0 用它通知"有新消息"
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))   # 子进程的入口就是 ModelRunner 的构造函数，
+            process.start()                                          #   构造函数最后进入 loop()，直到 exit 才返回
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events)     # ② rank 0 在主进程中构造，持有所有子进程的 Event
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        self.scheduler = Scheduler(config)                           # ③ 最后创建：需要 rank 0 的 allocate_kv_cache 写回的 num_kvcache_blocks
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        self.model_runner.call("exit")                               # 广播 exit：各 rank 关闭共享内存、销毁进程组
         del self.model_runner
         for p in self.ps:
-            p.join()
+            p.join()                                                 # 等待子进程的 loop 结束、进程退出
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

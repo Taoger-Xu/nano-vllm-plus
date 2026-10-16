@@ -19,6 +19,11 @@ class Scheduler:
     def is_finished(self):
         return not self.waiting and not self.running
 
+    """
+    请求到达，假设block_size = 4
+    add_request 创建 Sequence，放进 waiting 队列：
+    num_tokens = 10，num_cached_tokens = 0，block_table = []，status = WAITING
+    """
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
@@ -32,15 +37,19 @@ class Scheduler:
             remaining = self.max_num_batched_tokens - num_batched_tokens     # 限制二：本步剩余的 token 预算
             if remaining == 0:
                 break                                                        # token 预算用完，本批装满
-            if not seq.block_table:
+            if not seq.block_table: # 全新请求，或者是或者被抢占后（deallocate 清空了 block_table）重新调度
+                #  can_allocate(A)：# 能命中多少块？空闲块够不够？
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    break
+                    break # 放不下，等待
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
+            else: # chunked prefill 做到一半：块已经分配好
+                # 块已经有了，只需要接着算，seq.num_cached_tokens其在第一次调度的时候完成设置
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+             # 放不下且不是本批第一条 → 留到下一步，不切分
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break                                                        # 放不下且不是本批第一条 → 留到下一步，不切分
+                break        
+            # 第一次调度分配                                               
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)            # 第一条放不下时只取 remaining 个 → chunked prefill

@@ -21,7 +21,7 @@ class Sequence:
         self.token_ids = copy(token_ids)                     # prompt + 已生成的 token（只包含已确认的内容）；拷贝一份，避免改到调用者的列表
         self.last_token = token_ids[-1]                      # 最后一个 token：decode 时的输入，跨进程时只需传它
         self.num_tokens = len(self.token_ids)                # 当前总长度 = len(token_ids)，单独存一份是因为 worker 端不一定有完整 token_ids
-        self.num_prompt_tokens = len(token_ids)              # prompt 长度，用来区分 prompt 和生成部分
+        self.num_prompt_tokens = len(token_ids)              # prompt 长度，保持不变
         self.num_cached_tokens = 0                           # KV 已经在 cache 中的 token 数：prefix cache 命中 + 之前各步算完的部分
                                                              #   本步从这个位置开始计算
         self.num_scheduled_tokens = 0                        # 本步要计算的 token 数：prefill 时为一个 chunk 的长度，decode 时为 1

@@ -23,8 +23,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 数据面：所有 rank 在这里汇合建立 NCCL 进程组（rank 0 最后才构造，子进程会在这里等它）
+        # 之后 warmup、录 CUDA Graph 都有 all-reduce，各 rank 执行同一段 __init__，集合通信的顺序天然一致
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(rank)                                  # rank i 使用 GPU i
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -38,6 +40,8 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # 控制面：rank 0 创建 1MB 共享内存，用 barrier 保证子进程在它创建之后才去打开
+        # 名字 "nanovllm" 是固定的，所以同一台机器上不能同时运行两个 TP > 1 的实例
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -45,32 +49,35 @@ class ModelRunner:
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
-                self.loop()
+                self.loop()                                          # 子进程进入循环，直到收到 exit，构造函数才返回
 
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier()                                           # 等所有 rank 都 close 之后，
             if self.rank == 0:
-                self.shm.unlink()
+                self.shm.unlink()                                    #   才由 rank 0 把共享内存从系统中删除
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.graph_pool                         # 图中录有 NCCL 通信，要在销毁进程组之前删除
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
+        # rank > 0 的主循环：等待 rank 0 的指令 → 执行同名方法 → 再等待
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args)
+            self.call(method_name, *args)                            # rank > 0 时 call 不会再写共享内存，只在本地执行；返回值丢弃
             if method_name == "exit":
                 break
 
     def read_shm(self):
+        # 没有"已读确认"：rank 0 写下一条消息之前，要靠本次方法中的集合通信（run 的前向、exit 的 barrier）
+        # 保证子进程已经读完并 clear。所以每个通过 call 调用的方法都必须至少包含一次集合通信
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        self.event.wait()                                            # 阻塞，直到 rank 0 set
+        n = int.from_bytes(self.shm.buf[0:4], "little")              # 消息格式：[0, 4) 长度 n，[4, 4+n) pickle 数据
+        method_name, *args = pickle.loads(self.shm.buf[4:n+4])       # seqs 按 Sequence.__getstate__ 精简反序列化
+        self.event.clear()                                           # 复位，准备等下一条
         return method_name, args
 
     def write_shm(self, method_name, *args):
@@ -80,9 +87,11 @@ class ModelRunner:
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
-            event.set()
+            event.set()                                              # 通知每一个子进程
 
     def call(self, method_name, *args):
+        # SPMD 式的广播调用：rank 0 先把 [方法名, 参数] 写进共享内存，然后所有 rank 执行同一个方法
+        # 目前只有 run 和 exit 通过它调用；返回值只在 rank 0 有意义（run 返回 token_ids，其他 rank 返回 None）
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
@@ -102,6 +111,10 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    """
+    真实的分配kv cache对应的张量
+    实际的 KV Cache 是一个大张量，其物理布局
+    """
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -109,19 +122,36 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size   # KV cache 也按头切：每个 rank 只存自己的 kv 头，
+                                                                           #   所有 rank 共用 rank 0 Scheduler 分配的 block_table
+        # 注意：每个 rank 按自己 GPU 的空闲显存算块数，但 Scheduler 只用 rank 0 的结果；各卡空闲显存不同时可能越界，代码中没有检查
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        """
+            kv_cache = torch.empty(
+                2,                          # K 和 V
+                num_layers,                 # 层数
+                num_blocks,                 # 总块数
+                block_size,                 # 每块 token 数
+                num_kv_heads // tp_size,    # KV head 数（考虑张量并行）
+                head_dim                    # head 维度
+            )
+            不同的attention 通过索引获取自己的kv cache module.k_cache = kv_cache[0, layer_id]
+        """
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
+        # 绑定每一层的 KV cache 到对应的 attention 模块
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-
+    """
+    因为要传给 flash-attn 的是一个规整的二维张量，
+    而每条序列的块数不同，长短不一的列表拼不成矩阵
+    """
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -148,10 +178,12 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            # warmup 时的假序列没有分配块（KV cache 也还没分配），跳过，slot_mapping 为空
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
+            # 循环未命中的逻辑块
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
