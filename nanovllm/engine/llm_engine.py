@@ -48,7 +48,17 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        """执行一步：调度 → 所有 rank 执行 run → 后处理。
+
+        Returns:
+            tuple[list, int]: 本步完成的 (seq_id, completion_token_ids) 列表；以及 token 数，
+                prefill 为正（本步计算的 token 数），decode 为负（序列数）。
+        """
         seqs, is_prefill = self.scheduler.schedule()
+        # 推测步（每条序列算 1 + K 个 token）必须走 run_spec / postprocess_spec；
+        # 在它们实现之前，误走普通路径会让 num_cached_tokens 多加 K，与 KV cache 的实际内容不一致
+        if not is_prefill and seqs[0].num_scheduled_tokens > 1:
+            raise NotImplementedError("run_spec / postprocess_spec 尚未实现")
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
