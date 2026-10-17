@@ -6,7 +6,9 @@ from nanovllm.engine.sequence import Sequence
 
 
 class Block:
-    """一个物理 KV 块的元数据（账本）。真正的 K/V 存在 kv_cache[..., block_id, ...] 中。"""
+    """一个物理 KV 块的元数据（账本）。
+    真正的 K/V 存在 kv_cache[..., block_id, ...] 中。
+    """
 
     def __init__(self, block_id):
         """创建一个空闲块的元数据。
@@ -44,14 +46,24 @@ class Block:
 
 
 class BlockManager:
+    """一个模型的分页 KV cache 块管理器。
 
-    def __init__(self, num_blocks: int, block_size: int):
-        """创建分页 KV cache 的块管理器，所有块初始为空闲。
+    每个模型各有一个实例：大模型 role="target"，草稿模型 role="draft"。
+    所有方法只读写 seq.kv(role)，两个模型的块和进度互不影响。
+    """
+
+    def __init__(self, num_blocks: int, block_size: int, role: str = "target", enable_prefix_cache: bool = True):
+        """创建块管理器，所有块初始为空闲。
 
         Args:
             num_blocks (int): 物理块总数，由 ModelRunner.allocate_kv_cache 按显存计算。
             block_size (int): 每块容纳的 token 数。
+            role (str): 管理哪个模型的 KV 状态，"target" 或 "draft"。
+            enable_prefix_cache (bool): 是否启用 prefix cache；关闭时不查表、不登记 hash。
         """
+        assert role in ("target", "draft"), role
+        self.role = role
+        self.enable_prefix_cache = enable_prefix_cache
         self.block_size = block_size
         # 所有块的元数据，下标 = 物理块号
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
@@ -114,21 +126,22 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> int:
         """只读检查：能命中多少块 prefix cache，以及空闲块够不够放下整条序列。
 
-        不修改任何状态，调度器放弃时无需回滚。只在 seq.block_table 为空时由 Scheduler 调用
+        不修改任何状态，调度器放弃时无需回滚。只在本角色的 block_table 为空时由 Scheduler 调用
         （新请求、被抢占后重新调度）。
 
         Args:
             seq (Sequence): 待分配的序列。
 
         Returns:
-            int: -1 表示空闲块不够；>= 0 表示命中的块数，原样传给 allocate。
+            int: -1 表示空闲块不够；>= 0 表示命中的块数，原样传给 allocate。关闭 prefix cache 时命中数恒为 0。
         """
         h = -1
         num_cached_blocks = 0
         # ① 先假设所有块都要从 free 中取
         num_new_blocks = seq.num_blocks
-        # ② 不匹配最后一块：保证至少算一段，才能拿到 logits
-        for i in range(seq.num_blocks - 1):
+        # ② 不匹配最后一块：保证至少算一段，才能拿到 logits；关闭 prefix cache 时不查表
+        num_lookup_blocks = seq.num_blocks - 1 if self.enable_prefix_cache else 0
+        for i in range(num_lookup_blocks):
             token_ids = seq.block(i)
             # ③ h 代表从开头到第 i 块的整个前缀
             h = self.compute_hash(token_ids, h)
@@ -151,10 +164,11 @@ class BlockManager:
         完全信任 can_allocate 的返回值：两次调用之间 BlockManager 不能被修改。
 
         Args:
-            seq (Sequence): 待分配的序列，block_table 必须为空。
+            seq (Sequence): 待分配的序列，本角色的 block_table 必须为空。
             num_cached_blocks (int): can_allocate 返回的命中块数。
         """
-        assert not seq.block_table
+        kv = seq.kv(self.role)
+        assert not kv.block_table
         h = -1
         # ① 先处理命中的块，再分配新块：否则 popleft 可能取走并 reset 一个即将复活的缓存块
         for i in range(num_cached_blocks):
@@ -171,30 +185,31 @@ class BlockManager:
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
-            seq.block_table.append(block_id)
+            kv.block_table.append(block_id)
         # ④ 未命中的块：从 free 队头取新块
         for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
+            kv.block_table.append(self._allocate_block())
         # ⑤ 本步从哪个 token 开始计算
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        kv.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
-        """序列结束或被抢占时，归还它对所有块的引用，并清空 block_table 和 num_cached_tokens。
+        """序列结束或被抢占时，归还它对本角色所有块的引用，并清空本角色的 block_table 和 num_cached_tokens。
 
         Args:
             seq (Sequence): 要释放的序列。
         """
+        kv = seq.kv(self.role)
         # ① 逆序：尾部块先进 free、先被覆盖，常被共享的开头块留存最久
-        for block_id in reversed(seq.block_table):
+        for block_id in reversed(kv.block_table):
             block = self.blocks[block_id]
             # ② 共享块只减引用
             block.ref_count -= 1
             # ③ 没人用了 → 回到 free，hash 保留（可复活）
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        kv.num_cached_tokens = 0
         # ④ 清空后重新调度会再走 can_allocate，可能命中自己之前的块
-        seq.block_table.clear()
+        kv.block_table.clear()
 
     def _num_new_blocks(self, seq: Sequence, n: int) -> int:
         """计算本步还需要新分配多少块。
@@ -204,13 +219,14 @@ class BlockManager:
 
         Args:
             seq (Sequence): decode 中的序列。
-            n (int): 本步要写入 KV 的 token 数。
+            n (int): 本步要写入 KV 的 token 数；0 表示本步不写（例如不推测时的草稿模型）。
 
         Returns:
             int: 需要新分配的块数，不小于 0。
         """
-        needed = (seq.num_cached_tokens + n + self.block_size - 1) // self.block_size
-        return max(0, needed - len(seq.block_table))
+        kv = seq.kv(self.role)
+        needed = (kv.num_cached_tokens + n + self.block_size - 1) // self.block_size
+        return max(0, needed - len(kv.block_table))
 
     def can_append(self, seq: Sequence, n: int = 1) -> bool:
         """decode 前的只读检查：空闲块够不够本步写入 n 个 token。不够时 Scheduler 触发抢占。
@@ -231,8 +247,9 @@ class BlockManager:
             seq (Sequence): decode 中的序列。
             n (int): 本步要写入 KV 的 token 数，与 can_append 传入的相同。
         """
+        kv = seq.kv(self.role)
         for _ in range(self._num_new_blocks(seq, n)):
-            seq.block_table.append(self._allocate_block())
+            kv.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
         """把本步中被"写满"的块登记到 hash_to_block_id，之后的请求才能命中它们。
@@ -241,18 +258,21 @@ class BlockManager:
         本步计算的范围是 [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)。
 
         Args:
-            seq (Sequence): 本步参与计算的序列，num_scheduled_tokens 必须是本步已确认的 token 数。
+            seq (Sequence): 本步参与计算的序列，本角色的 num_scheduled_tokens 必须是本步已确认的 token 数。
         """
+        if not self.enable_prefix_cache:
+            return
+        kv = seq.kv(self.role)
         # ① 本步开始时所在的块（可能已写了一部分，尚未登记）
-        start = seq.num_cached_tokens // self.block_size
+        start = kv.num_cached_tokens // self.block_size
         # ② 向下取整：只登记写满的块
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        end = (kv.num_cached_tokens + kv.num_scheduled_tokens) // self.block_size
         # 本步没有写满任何块（大多数 decode 步）
         if start == end: return
         # ③ 链式哈希的起点：前一块早已登记
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        h = self.blocks[kv.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
+            block = self.blocks[kv.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             # ④ 块记下自己的身份（淘汰时要用）

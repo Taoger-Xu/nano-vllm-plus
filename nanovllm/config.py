@@ -50,6 +50,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 草稿模型 KV cache 的块数；由 ModelRunner.allocate_kv_cache 写入，未开启草稿模型时保持 -1
+    num_draft_kvcache_blocks: int = -1
+    # 是否启用 prefix cache；开启草稿模型时自动关闭（两个模型各自管理块，草稿模型无法复用大模型命中的前缀）
+    enable_prefix_cache: bool = True
     speculative_config: SpeculativeConfig | dict | None = None
 
     def __post_init__(self):
@@ -67,3 +71,5 @@ class Config:
             assert self.tensor_parallel_size == 1
             if spec.method == "draft_model":
                 assert spec.hf_config.vocab_size == self.hf_config.vocab_size
+                # 大模型命中前缀时两个模型的 prefill 起点会不同，第一版直接关闭
+                self.enable_prefix_cache = False

@@ -201,8 +201,9 @@ class ModelRunner:
 
         KV cache 是一个大张量：[2（K、V）, num_layers, num_blocks, block_size, num_kv_heads // tp_size, head_dim]，
         每层 Attention 通过 kv_cache[0, layer_id] / kv_cache[1, layer_id] 拿到自己的那一片。
-        开启草稿模型时两个模型共用 block_table，块数相同、各自拥有一块物理 KV cache；
-        每块的字节数取两个模型之和。结果写回 config.num_kvcache_blocks，供 Scheduler 使用。
+        开启草稿模型时两个模型各自拥有一块物理 KV cache，由两个 BlockManager 分别管理；
+        显存按两个模型每块字节数之和划分，两个池块数相同。
+        结果写回 config.num_kvcache_blocks / num_draft_kvcache_blocks，供 Scheduler 使用。
         """
         config = self.config
         hf_config = config.hf_config
@@ -221,12 +222,14 @@ class ModelRunner:
         self.bind_kv_cache(self.model, self.kv_cache, hf_config)
 
         if self.draft_model is not None:
+            config.num_draft_kvcache_blocks = config.num_kvcache_blocks
             draft_config = self.speculative_config.hf_config
             draft_num_kv_heads = draft_config.num_key_value_heads // self.world_size
             draft_head_dim = getattr(draft_config, "head_dim", draft_config.hidden_size // draft_config.num_attention_heads)
-            self.draft_kv_cache = torch.empty(2, draft_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, draft_num_kv_heads, draft_head_dim)
+            self.draft_kv_cache = torch.empty(2, draft_config.num_hidden_layers, config.num_draft_kvcache_blocks, self.block_size, draft_num_kv_heads, draft_head_dim)
             self.bind_kv_cache(self.draft_model, self.draft_kv_cache, draft_config)
-    def prepare_block_tables(self, seqs: list[Sequence]):
+
+    def prepare_block_tables(self, seqs: list[Sequence], role: str = "target"):
         """把各序列的 block_table 按本批最长的那条补 -1，拼成二维张量。
 
         flash-attn 需要规整的 [序列数, 最大块数] 张量；补的 -1 不会被读到，
@@ -234,24 +237,28 @@ class ModelRunner:
 
         Args:
             seqs (list[Sequence]): 本步的序列。
+            role (str): 取哪个模型的 block_table，"target" 或 "draft"。
 
         Returns:
             torch.Tensor: CUDA 上的 int32 张量，形状为 ``[len(seqs), max_num_blocks]``。
         """
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        tables = [seq.kv(role).block_table for seq in seqs]
+        max_len = max(len(table) for table in tables)
+        block_tables = [table + [-1] * (max_len - len(table)) for table in tables]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
-        """构造 prefill 的输入，并把 cu_seqlens、slot_mapping 等元数据写入全局 Context。
+    def prepare_prefill(self, seqs: list[Sequence], role: str = "target"):
+        """把seqs prefill 的输入，即GPU中前向计算所需的 input_ids、positions 等张量。
 
-        每条序列本步计算 [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)：
-        Q 只包含这部分新 token，K/V 覆盖 [0, end)；有前缀（prefix cache 命中或 chunked prefill 的后续块）时
+        每个seq本步计算 [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)
+        只负责这部分新 token，K/V 覆盖 [0, end)；
+        有前缀（prefix cache 命中或 chunked prefill 的后续块）时
         生成 block_tables，让 attention 从分页 cache 中读取 K/V。
 
         Args:
             seqs (list[Sequence]): 本步要 prefill 的序列。
+            role (str): 按哪个模型的 KV 状态（进度、block_table）准备，"target" 或 "draft"。
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: 拼接成一维的 input_ids 和 positions，均在 CUDA 上。
@@ -265,8 +272,9 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
+            kv = seq.kv(role)
+            start = kv.num_cached_tokens
+            seqlen_q = kv.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
             input_ids.extend(seq[start:end])
@@ -276,22 +284,22 @@ class ModelRunner:
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             # warmup 时的假序列没有分配块（KV cache 也还没分配），跳过，slot_mapping 为空
-            if not seq.block_table:    # warmup
+            if not kv.block_table:    # warmup
                 continue
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             # 循环未命中的逻辑块
             for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
+                slot_start = kv.block_table[i] * self.block_size
                 if i == start_block:
                     slot_start += start % self.block_size
                 if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+                    slot_end = kv.block_table[i] * self.block_size + self.block_size
                 else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                    slot_end = kv.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables = self.prepare_block_tables(seqs, role)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -302,6 +310,8 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         """构造 decode 的输入（每条序列 1 个 token），并把 slot_mapping、context_lens、block_tables 写入 Context。
+
+        只用于大模型：草稿模型的 decode 输入由推测路径单独准备。
 
         Args:
             seqs (list[Sequence]): 本步要 decode 的序列。
@@ -314,10 +324,12 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
+            pos = len(seq) - 1
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            positions.append(pos)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            # 按位置查块，而不是取 block_table[-1]：推测步之后 block_table 末尾可能有多留的块
+            slot_mapping.append(seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -371,22 +383,27 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run_prefill_models(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        """让主模型和草稿模型使用同一批输入执行 prefill。
+    def run_prefill_models(self, seqs: list[Sequence], input_ids: torch.Tensor, positions: torch.Tensor):
+        """执行 prefill：大模型前向并计算 logits；开启草稿模型时，草稿模型按自己的块表再前向一次，只写 KV cache。
+
+        两个模型的块表不同，草稿模型必须用 prepare_prefill(seqs, "draft") 重新生成 slot_mapping / block_tables，
+        不能复用大模型的 Context。
 
         Args:
-            input_ids (torch.Tensor): CUDA 上的输入 token，形状为 ``[num_tokens]``。
-            positions (torch.Tensor): CUDA 上的位置索引，形状为 ``[num_tokens]``。
+            seqs (list[Sequence]): 本步要 prefill 的序列。
+            input_ids (torch.Tensor): 大模型的输入 token（由 prepare_prefill(seqs) 生成，Context 已就绪）。
+            positions (torch.Tensor): 大模型的位置索引。
 
         Returns:
-            torch.Tensor: 主模型的 hidden states，供后续计算 logits；草稿模型只写入 KV cache。
+            torch.Tensor: 大模型的 logits；TP > 1 时只有 rank 0 拿到完整结果。
         """
-        # 两个模型复用同一套输入和 Context；Attention 的 cache 已分别绑定。
-        target_hidden_states = self.model(input_ids, positions)
+        # 先用大模型的 Context 算完 logits（LMHead 要读 cu_seqlens_q），再切换到草稿模型的 Context
+        logits = self.model.compute_logits(self.model(input_ids, positions))
         if self.draft_model is not None:
-            # 草稿模型此处只写 KV cache，不计算 logits。
-            self.draft_model(input_ids, positions)
-        return target_hidden_states
+            reset_context()
+            draft_input_ids, draft_positions = self.prepare_prefill(seqs, role="draft")
+            self.draft_model(draft_input_ids, draft_positions)
+        return logits
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
@@ -402,8 +419,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         if is_prefill:
-            hidden_states = self.run_prefill_models(input_ids, positions)
-            logits = self.model.compute_logits(hidden_states)
+            logits = self.run_prefill_models(seqs, input_ids, positions)
         else:
             logits = self.run_model(input_ids, positions, False)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
