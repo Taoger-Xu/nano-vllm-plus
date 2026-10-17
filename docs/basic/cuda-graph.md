@@ -363,7 +363,7 @@ attention 只需要一处改动就能覆盖四种情况：`Context` 新增 `q_le
 |---|---|
 | 验证走 decode 路径（`flash_attn_with_kvcache`），而不是 prefill 的 varlen 路径 | ②：没有 `max_seqlen` 这类 Python 标量 |
 | 每条序列的验证长度统一为 K+1；n-gram 草稿不足 K 个时补齐，补齐位置 `slot_mapping = -1` | ①：形状只取决于 bs |
-| 草稿模型第 0 步固定输入 2 个 token，而不是"落后时先做一次 prefill" | ① ⑤：不需要根据数据决定走哪条路径，形状永远是 `(bs, 2)` |
+| 草稿模型第 0 步在常见情况（落后 0 或 1 个）统一补齐为 2 个 token；只有从"不推测"切回"推测"、落后很多时才先做一次 eager 的追赶 | ① ⑤：常见路径不需要根据数据决定走哪条路径，形状永远是 `(bs, 2)` |
 | 本步是否推测由整个 batch 统一决定 | ①：一个 batch 只对应一种形状的图 |
 | 草稿 token 存在 ModelRunner 的局部张量中，每步拷进 `graph_vars` | ③：地址固定 |
 | NgramProposer、拒绝采样、`.tolist()` 都放在图外 | ④ ⑤：CPU 上的字符串匹配、依赖数据的接受逻辑都无法录制；它们本身只是少量 kernel 或 CPU 运算，不录也没关系 |

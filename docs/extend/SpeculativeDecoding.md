@@ -119,8 +119,8 @@ batch 增大后，有两项开销会变得显著：
 | 层 | 原来的前提 | 推测解码之后 |
 |---|---|---|
 | **Config** | 只有一个模型 | 新增推测解码的配置；草稿模型方法需要第二个模型的 hf_config |
-| **Sequence** | decode 时 `num_scheduled_tokens = 1` | 每步计算 1 + K 个 token，但只确认其中一部分 |
-| **BlockManager** | 每步最多新增 1 个块 | 一次为 1 + K 个 token 预留空间 |
+| **Sequence** | decode 时 `num_scheduled_tokens = 1` | 每步计算 1 + K 个 token，但只确认其中一部分；草稿模型方法还要记录草稿模型自己的块表和进度 |
+| **BlockManager** | 每步最多新增 1 个块 | 一次为 1 + K 个 token 预留空间；草稿模型方法中每个模型一个 BlockManager |
 | **prefix cache** | 写满的块一定是有效内容 | 被拒绝的 token 的 KV 也写进了 cache，**绝不能登记 hash** |
 | **Scheduler** | 每步 token 数 = 序列数 | 每步 token 数 = B·(1 + K)；后处理一次追加多个 token，EOS 可能出现在中间 |
 | **ModelRunner** | decode 的 Q 长度为 1 | 验证时 Q 长度为 1 + K；草稿模型方法还要管理第二个模型及其 KV cache |
@@ -365,66 +365,66 @@ class RejectionSampler(nn.Module):
 - **温度要一致**：草稿模型采样、计算 q 时使用与大模型相同的 temperature，否则 p/q 的比值没有意义；
 - 当前项目的 `SamplingParams` 不允许 temperature = 0。如果将来支持 greedy，验证就退化为"argmax 是否等于草稿"，可以跳过随机数。
 
-### 4. 草稿模型的 KV cache：与大模型共用一张 block_table
+### 4. 草稿模型的 KV cache：两套 KVState，两个 BlockManager
+
+两个模型的 KV 各自管理：块各自分配，进度各自记录。
 
 ```
-                       seq.block_table = [7, 2, 9]（只有一张）
-                                  │
-             ┌────────────────────┴────────────────────┐
-     大模型 kv_cache[:, :, 7]                  草稿模型 draft_kv_cache[:, :, 7]
-     （按大模型的层数、头数）                    （按草稿模型的层数、头数）
+seq.target_kv = KVState(block_table=[7, 2, 9], num_cached_tokens, num_scheduled_tokens)   ← scheduler.block_manager
+seq.draft_kv  = KVState(block_table=[3, 0, 5], num_cached_tokens, num_scheduled_tokens)   ← scheduler.draft_block_manager
+                         │                                    │
+               大模型 kv_cache[:, :, 7]              草稿模型 draft_kv_cache[:, :, 3]
 ```
 
-两个模型在每次前向时使用**同一份** `slot_mapping` 和 `block_tables`，各自把 KV 写进自己的池中相同块号的位置。所以：
+- **`Sequence`**：持有 `target_kv` / `draft_kv`，`seq.kv(role)` 按角色取；原有的 `block_table` / `num_cached_tokens` / `num_scheduled_tokens` 是转发到 `target_kv` 的属性，不开启草稿模型时其他代码不用改；
+- **`BlockManager(role, enable_prefix_cache)`**：每个模型一个实例，所有方法只读写 `seq.kv(role)`；
+- **Scheduler 让两个 BlockManager 同进同退**：准入（`can_allocate`）、预留（`can_append`）要两边都放得下才调度，任一方不够就抢占；抢占、结束时两边一起 `deallocate`；
+- **n-gram 方法**没有草稿模型，只有一个 BlockManager，这一节的内容全部跳过。
 
-- **BlockManager 完全不知道草稿模型的存在**，分配、释放、抢占只管理一套块；
-- **prefix cache 自动对两个模型生效**：命中的块在两个池中都有该前缀的 KV；
-- **n-gram 方法**没有第二个池，这一节的内容全部跳过。
+**prefix cache**：开启草稿模型时关闭（`Config` 自动设置 `enable_prefix_cache = False`）。原因是大模型命中前缀时，大模型从第 512 个 token 开始算，草稿模型却要从 0 开始，两个模型的 prefill 范围、token 预算和完成时间都会不同。第一版不处理这种情况。
 
-显存规划：`allocate_kv_cache` 中每个块的字节数改为两个模型之和，两个池的块数相同：
+**显存规划**：每个 token 在两个模型中都要存 KV，所以按两个模型每块字节数之和划分显存，两个池块数相同，块号空间各自独立：
 
 ```python
 block_bytes = target_block_bytes + draft_block_bytes
-config.num_kvcache_blocks = available // block_bytes
+config.num_kvcache_blocks = config.num_draft_kvcache_blocks = available // block_bytes
 self.kv_cache = torch.empty(2, target_layers, num_blocks, block_size, target_kv_heads, target_head_dim)
 self.draft_kv_cache = torch.empty(2, draft_layers, num_blocks, block_size, draft_kv_heads, draft_head_dim)
-# 分别绑定到两个模型的 Attention 模块的 k_cache / v_cache
 ```
 
-这里有一个前提：**登记了 hash 的块，两个池中的内容都必须有效**。所以：
+**prefill**：两个模型算同一段 token（prefix cache 关闭时两边进度始终相同），但块表不同，所以草稿模型要用 `prepare_prefill(seqs, "draft")` **单独生成** `slot_mapping` / `block_tables`。`run_prefill_models` 先在大模型的 Context 下前向并算完 logits（LMHead 要读 `cu_seqlens_q`），再切换到草稿模型的 Context 前向，只写 KV。warmup 中两个模型都执行，草稿模型的激活计入峰值。
 
-- **prefill 时两个模型都要跑**（包括 chunked prefill 的每一个 chunk）。`run()` 的 prefill 分支在大模型前向之后，用同一个 context 再调用一次 `self.draft_model(input_ids, positions)`，只写 KV，不计算 logits；
-- **warmup** 走的就是 prefill 路径，草稿模型自然被算进激活峰值；
-- decode 阶段由下一小节的"追赶"保证。
+开启草稿模型后，KV cache 能容纳的 token 数大约降为原来的 1 / (1 + 草稿每 token KV / 大模型每 token KV)。Qwen3-0.6B + Qwen3-8B 约为 56%。这是保留完整草稿 KV 的固有代价，实测 `max_batch_size` 时要同时观察抢占次数。
 
-### 5. 草稿模型的进度：Q=2 的第 0 步
+### 5. 草稿模型的进度：显式记录，按需追赶
 
-一个推测步结束后，两个模型的 KV 进度最多相差 1 个 token：
+`draft_kv.num_cached_tokens` 记录草稿模型的 KV 写到了哪里。它可以落后于大模型：
 
-```
-step 开始时：已确认 t0..t9，t9 = last_token，两个模型的 KV 都覆盖 t0..t8
-草稿模型：输入 t9, d1, ..., d_{K−1}，写入它们的 KV → 生成 d1..dK（dK 从未作为输入）
-大模型：  输入 t9, d1, ..., dK，写入它们的 KV
-```
+| 情况 | 草稿模型的进度 |
+|---|---|
+| prefill（包括 chunked prefill 的每个 chunk） | 和大模型一起推进，两边相等 |
+| 不推测的 decode 步（batch 太大、接近 `max_model_len`） | **草稿模型不运行**，进度不动，落后越来越多 |
+| 推测步 | 先补齐落后的部分，再生成 K 个草稿 |
 
-- 有草稿被拒绝时，两边的有效 KV 都覆盖到最后一个被接受的草稿，**进度一致**；
-- **K 个全部接受时**，大模型有 dK 的 KV，草稿模型没有，**草稿模型落后 1 个 token**。
-
-处理方法：**草稿模型的第 0 次前向总是输入最后 2 个已确认的 token**：
+调度时，`Scheduler._draft_num_tokens` 计算草稿模型本步要写多少个 token：推测步中草稿模型要写到位置 `len − 2 + K`（输入 last_token、d1 … d_{K−1}），所以
 
 ```
-第 0 次：  input = [token(len−2), last_token]，positions = [len−2, len−1]，Q = 2 → 采样 d1
-第 t 次：  input = [d_t]，position = len−1+t，Q = 1 → 采样 d_{t+1}       （t = 1..K−1）
+n_draft = (len − 1 + K) − draft_kv.num_cached_tokens        不推测时为 0
 ```
 
-- 落后 1 个时，正好补上位置 len−2 的 KV；
-- 没有落后时，位置 len−2 的 KV 被重新计算一遍，结果相同，覆盖写入无害。
+草稿模型的前向分两段：
 
-这样不需要额外的字段记录草稿模型的进度，第 0 步的形状永远是规整的 `(B, 2)`，可以录制 CUDA Graph。代价是每步多算 1 个 token，对小模型可以忽略。
+```
+第 0 次：  input = [draft_kv.num_cached_tokens, len) 这一段已确认的 token，最后一个是 last_token → 采样 d1
+第 t 次：  input = [d_t]，position = len − 1 + t，Q = 1 → 采样 d_{t+1}       （t = 1 .. K−1）
+```
 
-草稿模型前向时的 `context_lens`、`slot_mapping` 都按上面的位置计算，block_table 直接用 `seq.block_table`（调度时已经预留到 `len + K`）。草稿 token 只存在于 ModelRunner 的局部张量中，不写入 Sequence。
+第 0 次的长度等于"落后的 token 数 + 1"，是可变的：
 
-例外：如果序列恰好在"K 个全部接受"的这一步结束，dK 所在位置的草稿 KV 永远不会补上。若该块已登记 hash，之后命中它的请求会读到这个位置的旧数据。这只会让草稿模型猜得差一点；**验证由大模型完成，输出依然无损**。
+- **常见情况**：上一步也在推测，落后 0 或 1 个（K 个全部接受时，dK 从未作为草稿模型的输入）。可以统一补齐成 Q = 2：落后 0 个的序列多算一遍位置 `len − 2`，结果相同，覆盖写入无害（草稿模型不做 prefix cache，这个块不会被其他请求共享）。这样第 0 次的形状是规整的 `(B, 2)`，可以录制 CUDA Graph；
+- **少见情况**：刚从"不推测"切回"推测"，落后很多。这一步先用 prefill 式的输入（eager）把落后的部分补上，再进入 Q = 1 的循环。推测开关加上滞后，可以减少这种情况的次数。
+
+每轮推测开始时可以断言 `draft_kv.num_cached_tokens ≤ len(seq) − 1`，把进度关系变成可检查的不变量。草稿 token 只存在于 ModelRunner 的局部张量中，不写入 Sequence。
 
 ### 6. 进度字段：先算、再确认
 
@@ -472,6 +472,15 @@ def postprocess_spec(self, seqs: list[Sequence], token_ids: list[list[int]]) -> 
 ```
 
 `is_stop` 就是现有 `postprocess` 中的停止条件（EOS 或达到 `max_tokens`），抽成一个小函数供两处共用。返回值用于 LLMEngine 统计吞吐。
+
+开启草稿模型时，还要推进草稿模型的进度（上面的草图省略了这一步）。草稿模型本轮写到了 `draft_kv.num_cached_tokens + n_draft`，但其中只有已确认的 token 才是有效的 KV，所以
+
+```
+draft_kv.num_cached_tokens = min(draft_kv.num_cached_tokens + draft_kv.num_scheduled_tokens, target_kv.num_cached_tokens)
+draft_kv.num_scheduled_tokens = 0
+```
+
+K 个全部接受时，第一项比第二项小 1，草稿模型落后 1 个，下一轮第 0 次补上。
 
 顺序很重要：`hash_blocks` 用 `seq.block(i)` 读取 token 计算哈希，所以必须**先把被接受的草稿追加进 `token_ids`**，再调用它。
 
@@ -603,7 +612,7 @@ def run_spec(self, seqs: list[Sequence]):
     return self.rejection_sampler(logits, temperatures, draft_ids, num_drafts, draft_probs)
 ```
 
-`propose_draft_model` 循环 K 次：准备输入（第 0 次 Q=2，之后 Q=1）→ `run_draft_model`（走对应的草稿图）→ `sampler.sample_with_probs` 得到 token 和 q。
+`propose_draft_model` 循环 K 次：准备输入（第 0 次补齐落后的部分，常见情况为 Q=2；之后 Q=1，按 `draft_kv.block_table` 计算 slot）→ `run_draft_model`（走对应的草稿图）→ `sampler.sample_with_probs` 得到 token 和 q。
 
 `run_spec` **不修改 Sequence**，只返回 token 列表，所有状态变更都在 `Scheduler.postprocess_spec` 中完成。
 
@@ -646,8 +655,8 @@ num_accepted_tokens += Σ 接受数            （不含修正 / bonus token）
 | 方案 | 问题 | 本设计的做法 |
 |---|---|---|
 | **验证复用 prefill 的 varlen 路径** | 实现最简单，不需要改 attention；但 prefill 一律走 eager，验证步失去 CUDA Graph，省下的步数被 kernel 启动开销吃掉一部分；LMHead 还要新增"返回所有位置"的参数 | 走 decode 路径，`q_len = K+1`，单独录图；LMHead 不用改 |
-| **草稿模型独立的一套块管理**（两个 free 队列、两张 block_table） | 两个池的块数相等、分配和释放同步进行，维护的是同一份信息；草稿池也拿不到 prefix cache | 共用 block_table，两个池按相同的块号寻址 |
-| **记录草稿模型的 KV 进度，落后时先做一次草稿 prefill** | 需要额外的字段；只要 batch 中有一条序列落后，第 0 步就整体走 eager 的 varlen 路径 | 第 0 步固定 Q=2，形状规整 |
+| **两个模型共用一张 block_table**（最初的设计） | 草稿模型的进度是隐式的：必须保证"大模型写了哪里，草稿模型也写了"，否则出现看不见的空洞；不推测的步也得运行草稿模型；登记了 hash 的块会把草稿 KV 的空洞扩散给命中它的请求 | 两套 KVState、两个 BlockManager，草稿模型的进度显式记录（五.4、五.5）；代价是开启草稿模型时关闭 prefix cache |
+| **每一步都把草稿模型补到和大模型一样** | 不推测的步也要多跑一次小模型，约 +10%~20%，和"大 batch 时关闭推测以免变慢"的目的冲突 | 允许落后，重新推测时按 `draft_kv.num_cached_tokens` 一次补齐；常见情况第 0 步为 Q=2，形状规整 |
 | **草稿 token 写入 `token_ids`，验证后回滚** | Sequence 中出现未确认的内容；需要 `pop` 操作；回滚分散在 ModelRunner 和 Scheduler 两处 | 草稿只存在于 ModelRunner 的局部张量中；`token_ids` 只包含已确认的内容 |
 | **ModelRunner 直接修改 Sequence** | 状态被两处修改；worker 进程拿到的 Sequence 是每步重新反序列化的副本，修改它没有意义 | ModelRunner 只返回结果，Scheduler 统一修改 |
 | **n-gram 在 LLMEngine / Scheduler 中调用，草稿作为参数传给 ModelRunner** | 两种方法的调用位置不同，step() 中需要分支 | 两种 propose 都在 `run_spec` 内部，step() 只区分"普通 decode / 推测步" |
@@ -664,10 +673,10 @@ num_accepted_tokens += Σ 接受数            （不含修正 / bonus token）
 
 | 机制 | 需要注意的地方 |
 |---|---|
-| **prefill 优先** | 推测解码只发生在 decode step；prefill 时草稿模型与大模型使用同样的输入一起计算 |
+| **prefill 优先** | 推测解码只发生在 decode step；prefill 时草稿模型与大模型算同一段 token，各自按自己的块表准备输入 |
 | **chunked prefill** | 每个 chunk 两个模型都要算。最后一个 chunk 完成后序列进入 running，下一步开始才可能推测 |
-| **抢占** | 草稿从未写入 `token_ids`，重新 prefill 时不会带入未确认的内容；因为共用 block_table，两个池的块一起释放 |
-| **prefix cache** | 依靠"先修正 `num_scheduled_tokens`，再调用 `hash_blocks`"保证被拒绝的 KV 永远不会登记 hash；命中的块在两个池中都有效 |
+| **抢占** | 草稿从未写入 `token_ids`，重新 prefill 时不会带入未确认的内容；Scheduler 让两个 BlockManager 一起释放；只有草稿池不够时同样触发抢占 |
+| **prefix cache** | 依靠"先修正 `num_scheduled_tokens`，再调用 `hash_blocks`"保证被拒绝的 KV 永远不会登记 hash；开启草稿模型时 prefix cache 关闭 |
 | **max_tokens / EOS** | 一步最多产出 K+1 个 token，追加时逐个检查，满足停止条件立即停止 |
 | **max_model_len** | 任何序列 `len + K` 超出时，整批退回普通 decode |
 | **CUDA Graph** | 关闭推测解码、或本步不推测时，走原有的 decode 图；`enforce_eager=True` 时所有新增的图都不录制 |
@@ -676,13 +685,13 @@ num_accepted_tokens += Σ 接受数            （不含修正 / bonus token）
 
 | 文件 | 改动 |
 |---|---|
-| **config.py** | 新增 `SpeculativeConfig`；`Config` 新增 `speculative_config` 字段，dict 转换与校验 |
+| **config.py** | 新增 `SpeculativeConfig`；`Config` 新增 `speculative_config` 字段，dict 转换与校验；新增 `enable_prefix_cache`（开启草稿模型时自动关闭）和 `num_draft_kvcache_blocks` |
 | **新增 spec_decode/ngram_proposer.py** | `NgramProposer`：从长到短查找最近的一次匹配，输出 `draft_ids` / `num_drafts` |
 | **新增 spec_decode/rejection_sampler.py** | `RejectionSampler`：统一处理 q 为 one-hot / 完整分布、草稿不足 K 个的情况 |
-| **engine/block_manager.py** | `can_append(seq, n)` / `may_append(seq, n)`，n=1 时行为不变 |
-| **engine/scheduler.py** | decode 分支决定 n；新增 `postprocess_spec`；抽出 `is_stop`；累计接受率 |
-| **engine/sequence.py** | 不需要新字段；开启 draft_model 时 `__getstate__` 在 decode 阶段传最后 2 个 token（TP 扩展时） |
-| **engine/model_runner.py** | 按配置创建 `NgramProposer` 或加载草稿模型；`allocate_kv_cache` 计入草稿模型并绑定 `draft_kv_cache`；prefill 时草稿模型一起前向；新增 `prepare_verify`、`propose_draft_model`、`run_spec`；`capture_cudagraph` 抽成按 `(model, q_len)` 录制 |
+| **engine/block_manager.py** | `can_append(seq, n)` / `may_append(seq, n)`，n=1 时行为不变；新增 `role`、`enable_prefix_cache`，所有方法只读写 `seq.kv(role)` |
+| **engine/scheduler.py** | decode 分支决定 n；开启草稿模型时创建第二个 BlockManager，两边同进同退，`_draft_num_tokens` 计算草稿模型本步的写入量；新增 `postprocess_spec`；抽出 `is_stop`；累计接受率 |
+| **engine/sequence.py** | 新增 `KVState`，`Sequence` 持有 `target_kv` / `draft_kv`，原有三个字段转发到 `target_kv`；`__getstate__` 带上两份状态 |
+| **engine/model_runner.py** | 按配置创建 `NgramProposer` 或加载草稿模型；`allocate_kv_cache` 计入草稿模型并绑定 `draft_kv_cache`；`prepare_prefill` / `prepare_block_tables` 按角色准备输入，prefill 时草稿模型用自己的输入前向；新增 `prepare_verify`、`propose_draft_model`、`run_spec`；`capture_cudagraph` 抽成按 `(model, q_len)` 录制 |
 | **engine/llm_engine.py** | `step()` 按 `num_scheduled_tokens` 选择 `run` / `run_spec`；吞吐按实际 token 数统计；打印接受率 |
 | **utils/context.py** | 新增 `q_len: int = 1` |
 | **layers/attention.py** | decode 分支按 `q_len` reshape q 和 o |
@@ -694,8 +703,8 @@ num_accepted_tokens += Σ 接受数            （不含修正 / bonus token）
 
 1. **配置与骨架**：`SpeculativeConfig`、`can_append(seq, n)` / `may_append(seq, n)`、Scheduler 的分支、`postprocess_spec`，`q_len` 改动。先让 propose 永远返回 `num_drafts = 0`：每步只产出 1 个 token，输出分布应该与关闭推测解码时完全一致。这一步验证了预留、补齐、后处理和 `hash_blocks` 的正确性；
 2. **n-gram + 拒绝采样**：接入 `NgramProposer` 和 `RejectionSampler`，先用 `enforce_eager=True`。用重复性强的 prompt（例如"把下面这段代码原样输出"）检查接受率应该明显大于 0；
-3. **草稿模型**：加载、显存规划、prefill 时一起计算、Q=2 的第 0 步。一个很好的检查方法是**让草稿模型等于大模型**：这时 p = q，接受率应该接近 100%，每步产出接近 K+1 个 token；
-4. **边界测试**：用小 block_size 和小 KV 池，专门测试抢占、prefix cache 命中、`max_tokens` 和 EOS 出现在草稿中间、序列长度接近 `max_model_len` 的情况；
+3. **草稿模型**：加载、显存规划、两个 BlockManager、prefill 时按各自的块表一起计算、按 `draft_kv` 的进度追赶。一个很好的检查方法是**让草稿模型等于大模型**：这时 p = q，接受率应该接近 100%，每步产出接近 K+1 个 token；
+4. **边界测试**：用小 block_size 和小 KV 池，专门测试抢占（包括只有草稿池不够的情况）、prefix cache 命中（n-gram 方法）、`max_tokens` 和 EOS 出现在草稿中间、序列长度接近 `max_model_len`、从"不推测"切回"推测"时的大段追赶；
 5. **CUDA Graph**：录制 verify 图和两组草稿图，对比开启前后的吞吐；
 6. **确定默认值**：在 B = 1、8、16、32、64 上分别测试两种方法，确定 `max_batch_size` 和 K 的默认值；
 7. **（可选）** TP > 1、按接受率动态调整 K、异步生成草稿（GPU 执行第 t 步时 CPU 准备第 t+1 步的 n-gram 草稿）、EAGLE / MTP 风格的草稿头（作为第三种 `method` 接入同一框架）。

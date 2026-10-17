@@ -60,7 +60,7 @@
 | 4 | `_decode_num_tokens` 用 `len(self.running)` 判断 batch 大小，实际调度数还受 `max_num_seqs` 限制 | `max_num_seqs ≤ max_batch_size` 时可能误关推测（默认配置下不会发生） | 改为 `min(len(self.running), self.max_num_seqs)`（可选） |
 | 5 | 草稿模型落后很多时，一次补齐的计算量可能很大（例如 batch 长期超过 `max_batch_size` 后再降下来） | 重新进入推测的那一步变慢 | 观察实测数据；必要时限制单步补齐的长度，或给推测开关加滞后 |
 | 6 | 小问题：`NgramProposer` 中多余的 `min`、不必要的 `inference_mode`、非锁页内存的 `non_blocking` 拷贝；`Scheduler.__init__` 文档字符串的 `Args` 中缺少参数名 `config (Config):` | 无功能影响 | 顺手清理 |
-| 7 | [SpeculativeDecoding.md](SpeculativeDecoding.md) 五.4、五.5 和 [spdraft.md](spdraft.md) 仍按"共用 block_table"描述 | 文档与代码不一致 | 按第一节更新设计文档；spdraft.md 中 B-1 标记为不再需要 |
+| 7 | ~~设计文档仍按"共用 block_table"描述~~ 已更新：SpeculativeDecoding.md 五.4、五.5、五.6、六、七，spdraft.md，cuda-graph.md | — | — |
 
 ## 四、设计评估的结论
 
@@ -78,4 +78,4 @@
 3. `prepare_verify`、`run_spec`、`RejectionSampler`（五.3、五.9）
 4. `LLMEngine.step()` 接上 `run_spec` / `postprocess_spec`，打开 `spec_enabled`
 5. 先用"草稿全部拒绝"跑通，确认输出与普通 decode 同分布；再接入 n-gram，最后接入草稿模型并处理问题 1
-6. 按第一节更新设计文档（问题 7）
+6. ~~按第一节更新设计文档（问题 7）~~ 已完成

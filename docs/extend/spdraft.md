@@ -9,6 +9,8 @@
 
 > 前提：设计文档中的设计还没有完整实现，下面的"改进"都是设计层面的分析，没有实测数据支撑。对两个参考项目的分析来自阅读源码和它们的文档，没有在 GPU 上实际运行。
 
+> **更新（2026-10-17）**：草稿模型的 KV 管理已从"两个模型共用一张 block_table"改为"两套 KVState、两个 BlockManager"，与项目 B 的思路相同，并在开启草稿模型时关闭 prefix cache（见 [temp.md](temp.md) 第一节、设计文档五.4、五.5）。第一、二部分中"设计文档"一列关于共用 block_table、Q=2 补齐和 B-1 的描述，记录的是当时的方案，保留作对比；以第三部分和设计文档为准。
+
 ---
 
 # 第一部分：与项目 A 的对比
@@ -130,7 +132,7 @@
 
 | # | 事项 | 来源 | 影响设计文档的位置 |
 |---|---|---|---|
-| B-1 | **不推测的 decode 步也运行一次草稿模型**（Q=1，只写 KV、不算 logits），保证"大模型写了的位置，草稿模型也写了" | 代码检查 + 项目 B 的对比 | 五.5、五.8 |
+| B-1 | ~~不推测的 decode 步也运行一次草稿模型~~ **不再需要**：改为两套独立管理后，草稿模型的进度显式记录在 `draft_kv` 中，不推测时允许落后，重新推测时一次补齐 | 代码检查 + 项目 B 的对比 | 五.5 |
 | B-2 | `add_request` 时检查 `len(prompt) + max_tokens + K ≤ max_model_len`，代替"整批退回普通 decode" | 项目 B | 五.8 |
 | B-3 | 补齐行指向一个全零的 KV 块，或至少确认补齐行不会产生 NaN 或越界 | 项目 B | 五.9 (1) |
 | B-4 | 验证路径的备选方案：固定 `max_seqlen_*` 后用 varlen 路径录图；同时更正 cuda-graph.md 中"varlen 路径不能录图"的说法 | 项目 B | 五.9、cuda-graph.md |
@@ -146,8 +148,8 @@
 - [x] `SpeculativeConfig`：按方法校验、词表一致、token 预算断言（10）
 - [ ] `add_request` 时检查长度上限（B-2）
 - [ ] `Context.q_len` + attention decode 分支按 `q_len` reshape（12）
-- [ ] `BlockManager.can_append(seq, n)` / `may_append(seq, n)`：预留 `len + K`，多余的块不释放（沿用）
-- [ ] Scheduler decode 分支：按 batch 大小、`max_model_len` 整批决定是否推测（6、7）
+- [x] `BlockManager.can_append(seq, n)` / `may_append(seq, n)`：预留 `len + K`，多余的块不释放（沿用）
+- [x] Scheduler decode 分支：按 batch 大小、`max_model_len` 整批决定是否推测（6、7）。目前由 `spec_enabled = False` 关闭
 - [ ] `postprocess_spec`：草稿不进 `token_ids`，先修正 `num_scheduled_tokens` 再 `hash_blocks`（3、4）
 - [ ] 验证：`num_drafts = 0` 时输出分布与关闭推测解码时一致
 
@@ -158,14 +160,14 @@
 - [ ] 验证：重复性强的 prompt 接受率明显大于 0
 
 **第 3 步：草稿模型**
-- [x] 两个模型共用 block_table，`allocate_kv_cache` 按两个模型的块字节数之和分配（1）
-- [x] prefill 时草稿模型一起前向，warmup 计入草稿模型的激活（2、9）。注意：warmup 目前跳过了 `compute_logits` 和 `Sampler`
-- [ ] 草稿第 0 步固定 Q=2，之后 Q=1（2）。`DraftModelProposer` 目前没有 Q=2 的第 0 步
-- [ ] 不推测的 decode 步也运行草稿模型（B-1）
+- [x] 两套 `KVState`（`Sequence.target_kv` / `draft_kv`）、两个 BlockManager 同进同退；开启草稿模型时关闭 prefix cache；`allocate_kv_cache` 按两个模型的块字节数之和分配，两个池块数相同
+- [x] prefill 时草稿模型按自己的块表单独准备输入并前向，warmup 计入草稿模型的激活（9）。注意：warmup 目前跳过了 `compute_logits` 和 `Sampler`
+- [ ] 草稿模型按 `draft_kv.num_cached_tokens` 追赶：第 0 次补齐落后部分（常见情况 Q=2），之后 Q=1。`DraftModelProposer` 目前没有处理落后
+- [x] ~~不推测的 decode 步也运行草稿模型（B-1）~~ 不再需要
 - [ ] 验证：草稿模型 = 大模型时，接受率接近 100%
 
 **第 4 步：边界测试**
-- [ ] 抢占、prefix cache 命中、`max_tokens` / EOS 出现在草稿中间、接近 `max_model_len`
+- [ ] 抢占（包括只有草稿池不够）、prefix cache 命中（n-gram）、`max_tokens` / EOS 出现在草稿中间、接近 `max_model_len`、从不推测切回推测时的大段追赶
 - [ ] 三道 GPU 检查（B-5）
 
 **第 5 步：CUDA Graph**
