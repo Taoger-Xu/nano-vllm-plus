@@ -252,7 +252,8 @@ class ModelRunner:
         """把seqs prefill 的输入，即GPU中前向计算所需的 input_ids、positions 等张量。
 
         每个seq本步计算 [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)
-        只负责这部分新 token，K/V 覆盖 [0, end)；
+        只计算这部分新 token的Q，K/V 覆盖 [0, end)；
+
         有前缀（prefix cache 命中或 chunked prefill 的后续块）时
         生成 block_tables，让 attention 从分页 cache 中读取 K/V。
 
